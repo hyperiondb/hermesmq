@@ -1,0 +1,21 @@
+[package]
+name = "hermesmqd"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+readme.workspace = true
+description = "hermesmq server daemon: a Raft-replicated message queue"
+
+[[bin]]
+name = "hermesmqd"
+path = "src/main.rs"
+
+[dependencies]
+hermesmq-core = { path = "../hermesmq-core", version = "=0.1.0" }
+tokio.workspace = true
+anyhow.workspace = true
+clap.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true

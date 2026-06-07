@@ -1,0 +1,142 @@
+syntax = "proto3";
+
+package hermesmq;
+
+message Request {
+  oneof kind {
+    Produce produce = 1;
+    Poll poll = 2;
+    Ack ack = 3;
+    Nack nack = 4;
+    Commit commit = 5;
+    CreateTopic create_topic = 6;
+    DeleteTopic delete_topic = 7;
+    Stats stats = 8;
+    Bootstrap bootstrap = 9;
+    SetRateLimit set_rate_limit = 10;
+    SetRetention set_retention = 11;
+    Subscribe subscribe = 12;
+  }
+}
+
+message Subscribe {
+  string topic = 1;
+  string group = 2;
+  uint32 prefetch = 3;
+  uint64 visibility_timeout_ms = 4;
+  string ack_mode = 5;
+}
+
+message SetRateLimit {
+  string topic = 1;
+  double rate_per_sec = 2;
+  uint32 burst = 3;
+}
+
+message SetRetention {
+  string topic = 1;
+  uint64 max_messages = 2;
+  uint64 max_age_ms = 3;
+}
+
+message Node {
+  uint64 id = 1;
+  string peer_addr = 2;
+}
+
+message Bootstrap {
+  repeated Node nodes = 1;
+}
+
+message Produce {
+  string topic = 1;
+  uint32 priority = 2;
+  uint32 content_type = 3;
+  bytes payload = 4;
+  string producer_id = 5;
+  uint64 seq = 6;
+}
+
+message Poll {
+  string topic = 1;
+  string group = 2;
+  uint32 max = 3;
+  uint64 visibility_timeout_ms = 4;
+  string ack_mode = 5;
+  uint64 wait_ms = 6;
+}
+
+message Ack {
+  string topic = 1;
+  string group = 2;
+  uint64 lease_id = 3;
+}
+
+message Nack {
+  string topic = 1;
+  string group = 2;
+  uint64 lease_id = 3;
+}
+
+message Commit {
+  string topic = 1;
+  string group = 2;
+  uint64 offset = 3;
+}
+
+message CreateTopic {
+  string topic = 1;
+}
+
+message DeleteTopic {
+  string topic = 1;
+}
+
+message Stats {}
+
+message Response {
+  oneof kind {
+    Produced produced = 1;
+    Polled polled = 2;
+    Ok ok = 3;
+    Error error = 4;
+    StatsResult stats = 5;
+  }
+}
+
+message Produced {
+  uint64 offset = 1;
+}
+
+message Delivered {
+  uint64 lease_id = 1;
+  uint64 offset = 2;
+  uint32 priority = 3;
+  uint32 content_type = 4;
+  bytes payload = 5;
+  uint64 ts_ms = 6;
+}
+
+message Polled {
+  repeated Delivered items = 1;
+}
+
+message Ok {}
+
+message Error {
+  string code = 1;
+  string message = 2;
+  string leader_addr = 3;
+  uint64 retry_after_ms = 4;
+}
+
+message StatsResult {
+  uint64 last_applied = 1;
+  uint64 current_leader = 2;
+  uint64 current_term = 3;
+  uint64 last_log_index = 4;
+  bool is_leader = 5;
+  uint64 topics = 6;
+  uint64 messages = 7;
+  uint64 in_flight = 8;
+}

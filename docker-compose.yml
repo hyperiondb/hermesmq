@@ -1,0 +1,47 @@
+services:
+  hermesmq1:
+    build: .
+    command: ["--node-id", "1", "--client-addr", "0.0.0.0:7600", "--peer-addr", "0.0.0.0:7700", "--metrics-addr", "0.0.0.0:9600", "--data-dir", "/data"]
+    ports:
+      - "7600:7600"
+      - "9600:9600"
+    volumes:
+      - hermesmq1-data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:9600/health"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+  hermesmq2:
+    build: .
+    command: ["--node-id", "2", "--client-addr", "0.0.0.0:7600", "--peer-addr", "0.0.0.0:7700", "--metrics-addr", "0.0.0.0:9600", "--data-dir", "/data"]
+    ports:
+      - "7601:7600"
+      - "9601:9600"
+    volumes:
+      - hermesmq2-data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:9600/health"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+  hermesmq3:
+    build: .
+    command: ["--node-id", "3", "--client-addr", "0.0.0.0:7600", "--peer-addr", "0.0.0.0:7700", "--metrics-addr", "0.0.0.0:9600", "--data-dir", "/data"]
+    ports:
+      - "7602:7600"
+      - "9602:9600"
+    volumes:
+      - hermesmq3-data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:9600/health"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+volumes:
+  hermesmq1-data:
+  hermesmq2-data:
+  hermesmq3-data:
