@@ -27,6 +27,7 @@ Status: **in progress**
 
 | Crate | Role |
 |---|---|
+| `crates/hermesmq` | Umbrella library — re-exports `hermesmq-core` (`cargo add hermesmq`) |
 | `crates/hermesmq-proto` | Protobuf wire types (`prost`), shared by server and clients |
 | `crates/hermesmq-core` | Storage (redb), Raft engine, queue state machine, TCP/protobuf + HTTP servers |
 | `crates/hermesmqd` | The server daemon binary |
@@ -35,7 +36,7 @@ Status: **in progress**
 
 ```sh
 cargo build --release
-cargo test            # 30 tests: unit + client-protocol + cluster + durability + http + slow-disk
+cargo test            # 33 tests: unit + client-protocol + cluster + durability + http + slow-disk
 ```
 
 ## Run a node

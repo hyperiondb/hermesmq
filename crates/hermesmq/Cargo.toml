@@ -1,0 +1,14 @@
+[package]
+name = "hermesmq"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
+description = "A simple, Raft-replicated message queue with priority, rate limiting, and push/pull delivery"
+
+[dependencies]
+hermesmq-core = { path = "../hermesmq-core", version = "=0.1.1" }

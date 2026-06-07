@@ -11,7 +11,7 @@ categories.workspace = true
 description = "Core engine for hermesmq: queue state machine and Raft application types"
 
 [dependencies]
-hermesmq-proto = { path = "../hermesmq-proto", version = "=0.1.0" }
+hermesmq-proto = { path = "../hermesmq-proto", version = "=0.1.1" }
 serde.workspace = true
 serde_json.workspace = true
 openraft.workspace = true
