@@ -67,6 +67,7 @@ addon's `connect()` does this automatically).
 | `--client-addr` | `HERMESMQ_CLIENT_ADDR` | `127.0.0.1:7600` | Client protobuf/TCP listener |
 | `--peer-addr` | `HERMESMQ_PEER_ADDR` | `127.0.0.1:7700` | Inter-node Raft RPC listener |
 | `--metrics-addr` | `HERMESMQ_METRICS_ADDR` | `127.0.0.1:9600` | HTTP `/health` `/ready` `/metrics` |
+| `--metrics-enabled` | `HERMESMQ_METRICS_ENABLED` | `true` | `false` disables Prometheus `/metrics` (`/health` and `/ready` stay on) |
 
 Every flag can also be set via its environment variable; a CLI flag takes precedence. The Docker
 image bakes in container-appropriate defaults (`0.0.0.0` listeners, `/data` data dir), so a
@@ -260,7 +261,9 @@ returns after its batch is durable and replicated — semantics are unchanged.
 - `GET /health` → `200 ok` (liveness)
 - `GET /ready`  → `200` if the node sees a leader, else `503` (readiness)
 - `GET /metrics` → Prometheus text: Raft term/leader, last-applied, last-log-index, replication lag,
-  topics, messages, in-flight.
+  topics, messages, in-flight. Disable with `HERMESMQ_METRICS_ENABLED=false` (or
+  `--metrics-enabled false`) — the endpoint then returns `404` while `/health` and `/ready` keep
+  working.
 
 ## Delivery semantics
 

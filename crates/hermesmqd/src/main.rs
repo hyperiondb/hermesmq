@@ -23,6 +23,14 @@ struct Cli {
 
     #[arg(long, env = "HERMESMQ_METRICS_ADDR", default_value = "127.0.0.1:9600")]
     metrics_addr: SocketAddr,
+
+    #[arg(
+        long,
+        env = "HERMESMQ_METRICS_ENABLED",
+        default_value_t = true,
+        action = clap::ArgAction::Set
+    )]
+    metrics_enabled: bool,
 }
 
 #[tokio::main]
@@ -52,13 +60,14 @@ async fn main() -> anyhow::Result<()> {
         peer = %cli.peer_addr,
         client = %cli.client_addr,
         metrics = %cli.metrics_addr,
+        metrics_enabled = cli.metrics_enabled,
         data_dir = %cli.data_dir.display(),
         "hermesmqd listening (waiting for client bootstrap)"
     );
 
     tokio::spawn(serve_peer(raft.clone(), peer_listener));
     tokio::spawn(serve_clients(raft.clone(), sm.clone(), client_listener));
-    tokio::spawn(serve_http(raft.clone(), sm, metrics_listener));
+    tokio::spawn(serve_http(raft.clone(), sm, metrics_listener, cli.metrics_enabled));
 
     tokio::signal::ctrl_c().await?;
     tracing::info!("shutdown signal received; stopping raft node");

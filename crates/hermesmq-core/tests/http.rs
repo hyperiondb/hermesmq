@@ -18,8 +18,7 @@ async fn get(addr: std::net::SocketAddr, path: &str) -> (String, String) {
     (status, body)
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn http_health_ready_metrics() {
+async fn start_node() -> (hermesmq_core::HermesRaft, hermesmq_core::StateMachineStore) {
     let db = Arc::new(RedbStore::in_memory().unwrap());
     let (raft, sm) = build_raft(1, db).await.unwrap();
     initialize_cluster(&raft, &[(1, "127.0.0.1:9".to_string())])
@@ -31,10 +30,15 @@ async fn http_health_ready_metrics() {
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
+    (raft, sm)
+}
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn http_health_ready_metrics() {
+    let (raft, sm) = start_node().await;
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    tokio::spawn(serve_http(raft.clone(), sm, listener));
+    tokio::spawn(serve_http(raft.clone(), sm, listener, true));
 
     let (status, body) = get(addr, "/health").await;
     assert!(status.contains("200"), "health status: {status}");
@@ -50,4 +54,22 @@ async fn http_health_ready_metrics() {
 
     let (status, _) = get(addr, "/nope").await;
     assert!(status.contains("404"), "unknown path status: {status}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn http_metrics_can_be_disabled() {
+    let (raft, sm) = start_node().await;
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(serve_http(raft.clone(), sm, listener, false));
+
+    let (status, body) = get(addr, "/metrics").await;
+    assert!(status.contains("404"), "disabled metrics status: {status}");
+    assert!(body.contains("metrics disabled"));
+
+    let (status, _) = get(addr, "/health").await;
+    assert!(status.contains("200"), "health must stay available: {status}");
+
+    let (status, _) = get(addr, "/ready").await;
+    assert!(status.contains("200"), "ready must stay available: {status}");
 }

@@ -3,6 +3,7 @@ services:
     build: .
     environment:
       - HERMESMQ_NODE_ID=1
+      - HERMESMQ_METRICS_ENABLED=true
     ports:
       - "7600:7600"
       - "9600:9600"
@@ -18,6 +19,7 @@ services:
     build: .
     environment:
       - HERMESMQ_NODE_ID=2
+      - HERMESMQ_METRICS_ENABLED=true
     ports:
       - "7601:7600"
       - "9601:9600"
@@ -33,6 +35,7 @@ services:
     build: .
     environment:
       - HERMESMQ_NODE_ID=3
+      - HERMESMQ_METRICS_ENABLED=true
     ports:
       - "7602:7600"
       - "9602:9600"

@@ -15,6 +15,7 @@ COPY --from=builder /build/target/release/hermesmqd /usr/local/bin/hermesmqd
 ENV HERMESMQ_CLIENT_ADDR=0.0.0.0:7600 \
     HERMESMQ_PEER_ADDR=0.0.0.0:7700 \
     HERMESMQ_METRICS_ADDR=0.0.0.0:9600 \
+    HERMESMQ_METRICS_ENABLED=$HERMESMQ_METRICS_ENABLED \
     HERMESMQ_DATA_DIR=/data
 
 VOLUME ["/data"]
