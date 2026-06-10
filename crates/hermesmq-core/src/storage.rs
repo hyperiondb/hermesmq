@@ -168,7 +168,14 @@ impl Storage for RedbStore {
     }
 
     fn save_committed(&self, committed: &[u8]) -> Result<()> {
-        self.put(KEY_COMMITTED, committed)
+        let mut wtx = self.db.begin_write().map_err(st)?;
+        wtx.set_durability(Durability::Eventual);
+        {
+            let mut table = wtx.open_table(META).map_err(st)?;
+            table.insert(KEY_COMMITTED, committed).map_err(st)?;
+        }
+        wtx.commit().map_err(st)?;
+        Ok(())
     }
 
     fn read_committed(&self) -> Result<Option<Vec<u8>>> {

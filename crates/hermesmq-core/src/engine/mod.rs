@@ -44,7 +44,13 @@ pub async fn build_raft_partitionable<S: Storage>(
     db: Arc<S>,
 ) -> Result<(HermesRaft, StateMachineStore<S>, PartitionControl), Box<dyn std::error::Error + Send + Sync>>
 {
-    let config = Arc::new(Config::default());
+    let config = Arc::new(Config {
+        heartbeat_interval: 100,
+        election_timeout_min: 500,
+        election_timeout_max: 1500,
+        max_payload_entries: 32,
+        ..Config::default()
+    });
     let log = LogStore::new(db.clone());
     let state_machine = StateMachineStore::new(db)?;
     let sm_read = state_machine.clone();

@@ -1,0 +1,3 @@
+[alias]
+e2e = "test -p hermesmq-core --test e2e_docker -- --ignored --nocapture"
+perf = "test -p hermesmq-core --release --test perf -- --ignored --nocapture --test-threads=1"

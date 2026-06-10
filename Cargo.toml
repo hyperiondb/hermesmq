@@ -3,7 +3,7 @@ resolver = "2"
 members = ["crates/hermesmq", "crates/hermesmq-core", "crates/hermesmq-proto", "crates/hermesmqd"]
 
 [workspace.package]
-version = "0.1.1"
+version = "0.2.0"
 edition = "2021"
 license = "GPL-3.0-or-later"
 authors = ["Tadas Talaikis <info@nordlet.com>"]
@@ -22,7 +22,7 @@ tracing = "=0.1.44"
 tracing-subscriber = { version = "=0.3.23", features = ["env-filter"] }
 openraft = { version = "=0.9.24", features = ["serde", "storage-v2"] }
 redb = "=2.6.3"
-clap = { version = "=4.6.1", features = ["derive"] }
+clap = { version = "=4.6.1", features = ["derive", "env"] }
 postcard = { version = "=1.1.3", features = ["use-std"] }
 prost = "=0.13.5"
 prost-build = "=0.13.5"

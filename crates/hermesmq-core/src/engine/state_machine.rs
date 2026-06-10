@@ -32,7 +32,6 @@ struct StoredSnapshot {
 
 struct Inner {
     data: StateMachineData,
-    snapshot: Option<StoredSnapshot>,
     snapshot_seq: u64,
 }
 
@@ -52,18 +51,16 @@ impl<S> Clone for StateMachineStore<S> {
 
 impl<S: Storage> StateMachineStore<S> {
     pub fn new(db: Arc<S>) -> Result<Self, StorageError<NodeId>> {
-        let (data, snapshot) = match db.get(KEY_SNAPSHOT).map_err(sread)? {
+        let data = match db.get(KEY_SNAPSHOT).map_err(sread)? {
             Some(bytes) => {
                 let stored: StoredSnapshot = dec(&bytes)?;
-                let data: StateMachineData = dec(&stored.data)?;
-                (data, Some(stored))
+                dec(&stored.data)?
             }
-            None => (StateMachineData::default(), None),
+            None => StateMachineData::default(),
         };
         Ok(Self {
             inner: Arc::new(Mutex::new(Inner {
                 data,
-                snapshot,
                 snapshot_seq: 0,
             })),
             db,
@@ -94,33 +91,6 @@ fn persist_snapshot<S: Storage>(
 ) -> Result<(), StorageError<NodeId>> {
     let bytes = enc(stored)?;
     db.put(KEY_SNAPSHOT, &bytes).map_err(swrite)
-}
-
-fn build(inner: &mut Inner) -> Result<(Snapshot<TypeConfig>, StoredSnapshot), StorageError<NodeId>> {
-    let bytes = enc(&inner.data)?;
-    inner.snapshot_seq += 1;
-    let last = inner.data.last_applied;
-    let snapshot_id = match &last {
-        Some(log_id) => format!("{}-{}", log_id.index, inner.snapshot_seq),
-        None => format!("none-{}", inner.snapshot_seq),
-    };
-    let meta = SnapshotMeta {
-        last_log_id: last,
-        last_membership: inner.data.last_membership.clone(),
-        snapshot_id,
-    };
-    let stored = StoredSnapshot {
-        meta: meta.clone(),
-        data: bytes.clone(),
-    };
-    inner.snapshot = Some(stored.clone());
-    Ok((
-        Snapshot {
-            meta,
-            snapshot: Box::new(Cursor::new(bytes)),
-        },
-        stored,
-    ))
 }
 
 impl<S: Storage> RaftStateMachine<TypeConfig> for StateMachineStore<S> {
@@ -181,23 +151,22 @@ impl<S: Storage> RaftStateMachine<TypeConfig> for StateMachineStore<S> {
             meta: meta.clone(),
             data: bytes,
         };
-        {
-            let mut inner = self.inner.lock().unwrap();
-            inner.data = data;
-            inner.snapshot = Some(stored.clone());
-        }
-        persist_snapshot(self.db.as_ref(), &stored)
+        persist_snapshot(self.db.as_ref(), &stored)?;
+        self.inner.lock().unwrap().data = data;
+        Ok(())
     }
 
     async fn get_current_snapshot(
         &mut self,
     ) -> Result<Option<Snapshot<TypeConfig>>, StorageError<NodeId>> {
-        let inner = self.inner.lock().unwrap();
-        match &inner.snapshot {
-            Some(s) => Ok(Some(Snapshot {
-                meta: s.meta.clone(),
-                snapshot: Box::new(Cursor::new(s.data.clone())),
-            })),
+        match self.db.get(KEY_SNAPSHOT).map_err(sread)? {
+            Some(bytes) => {
+                let stored: StoredSnapshot = dec(&bytes)?;
+                Ok(Some(Snapshot {
+                    meta: stored.meta,
+                    snapshot: Box::new(Cursor::new(stored.data)),
+                }))
+            }
             None => Ok(None),
         }
     }
@@ -210,11 +179,27 @@ pub struct SnapshotBuilder<S = RedbStore> {
 
 impl<S: Storage> RaftSnapshotBuilder<TypeConfig> for SnapshotBuilder<S> {
     async fn build_snapshot(&mut self) -> Result<Snapshot<TypeConfig>, StorageError<NodeId>> {
-        let (snapshot, stored) = {
+        let (meta, bytes) = {
             let mut inner = self.inner.lock().unwrap();
-            build(&mut inner)?
+            let bytes = enc(&inner.data)?;
+            inner.snapshot_seq += 1;
+            let last = inner.data.last_applied;
+            let snapshot_id = match &last {
+                Some(log_id) => format!("{}-{}", log_id.index, inner.snapshot_seq),
+                None => format!("none-{}", inner.snapshot_seq),
+            };
+            let meta = SnapshotMeta {
+                last_log_id: last,
+                last_membership: inner.data.last_membership.clone(),
+                snapshot_id,
+            };
+            (meta, bytes)
         };
+        let stored = StoredSnapshot { meta, data: bytes };
         persist_snapshot(self.db.as_ref(), &stored)?;
-        Ok(snapshot)
+        Ok(Snapshot {
+            meta: stored.meta,
+            snapshot: Box::new(Cursor::new(stored.data)),
+        })
     }
 }

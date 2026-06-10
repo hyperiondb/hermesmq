@@ -1,0 +1,30 @@
+services:
+  hermesmq1:
+    build: .
+    image: hermesmq-e2e
+    environment:
+      - HERMESMQ_NODE_ID=1
+      - RUST_LOG=info,openraft=warn
+    ports:
+      - "17600:7600"
+      - "19600:9600"
+
+  hermesmq2:
+    build: .
+    image: hermesmq-e2e
+    environment:
+      - HERMESMQ_NODE_ID=2
+      - RUST_LOG=info,openraft=warn
+    ports:
+      - "17601:7600"
+      - "19601:9600"
+
+  hermesmq3:
+    build: .
+    image: hermesmq-e2e
+    environment:
+      - HERMESMQ_NODE_ID=3
+      - RUST_LOG=info,openraft=warn
+    ports:
+      - "17602:7600"
+      - "19602:9600"

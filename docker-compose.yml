@@ -1,7 +1,8 @@
 services:
   hermesmq1:
     build: .
-    command: ["--node-id", "1", "--client-addr", "0.0.0.0:7600", "--peer-addr", "0.0.0.0:7700", "--metrics-addr", "0.0.0.0:9600", "--data-dir", "/data"]
+    environment:
+      - HERMESMQ_NODE_ID=1
     ports:
       - "7600:7600"
       - "9600:9600"
@@ -15,7 +16,8 @@ services:
 
   hermesmq2:
     build: .
-    command: ["--node-id", "2", "--client-addr", "0.0.0.0:7600", "--peer-addr", "0.0.0.0:7700", "--metrics-addr", "0.0.0.0:9600", "--data-dir", "/data"]
+    environment:
+      - HERMESMQ_NODE_ID=2
     ports:
       - "7601:7600"
       - "9601:9600"
@@ -29,7 +31,8 @@ services:
 
   hermesmq3:
     build: .
-    command: ["--node-id", "3", "--client-addr", "0.0.0.0:7600", "--peer-addr", "0.0.0.0:7700", "--metrics-addr", "0.0.0.0:9600", "--data-dir", "/data"]
+    environment:
+      - HERMESMQ_NODE_ID=3
     ports:
       - "7602:7600"
       - "9602:9600"

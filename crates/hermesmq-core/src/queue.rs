@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use serde::{Deserialize, Serialize};
 
-use crate::raft::{AppRequest, AppResponse, Delivered};
+use crate::raft::{AppRequest, AppResponse, Delivered, ProduceItem};
 use crate::types::{LeaseId, Message, Offset, Priority};
 
 const DEDUP_CAPACITY: usize = 100_000;
@@ -19,15 +19,11 @@ struct GroupState {
     ack_watermark: Offset,
     acked_above: BTreeSet<Offset>,
     in_flight: BTreeMap<LeaseId, Lease>,
-    leased_offsets: BTreeSet<Offset>,
+    leased_offsets: BTreeMap<Offset, u64>,
     poll_count: u64,
 }
 
 impl GroupState {
-    fn is_done(&self, offset: Offset) -> bool {
-        offset < self.ack_watermark || self.acked_above.contains(&offset)
-    }
-
     fn mark_acked(&mut self, offset: Offset) {
         if offset < self.ack_watermark {
             return;
@@ -51,11 +47,32 @@ impl GroupState {
             }
         }
     }
+
+    fn advance_watermark(&mut self, to: Offset) {
+        if to > self.ack_watermark {
+            self.ack_watermark = to;
+        }
+        let watermark = self.ack_watermark;
+        self.acked_above.retain(|o| *o >= watermark);
+        let drop: Vec<LeaseId> = self
+            .in_flight
+            .iter()
+            .filter(|(_, l)| l.offset < watermark)
+            .map(|(id, _)| *id)
+            .collect();
+        for id in drop {
+            if let Some(l) = self.in_flight.remove(&id) {
+                self.leased_offsets.remove(&l.offset);
+            }
+        }
+        while self.acked_above.remove(&self.ack_watermark) {
+            self.ack_watermark += 1;
+        }
+    }
 }
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 struct TopicState {
-    exists: bool,
     next_offset: Offset,
     messages: BTreeMap<Offset, Message>,
     dedup: BTreeMap<(String, u64), Offset>,
@@ -77,7 +94,7 @@ impl Queue {
     pub fn apply(&mut self, req: AppRequest) -> AppResponse {
         match req {
             AppRequest::CreateTopic { topic } => {
-                self.topics.entry(topic.0).or_default().exists = true;
+                self.topics.entry(topic.0).or_default();
                 AppResponse::TopicCreated
             }
             AppRequest::DeleteTopic { topic } => {
@@ -93,38 +110,20 @@ impl Queue {
                 seq,
                 ts_ms,
             } => {
-                let t = self.topics.entry(topic.0).or_default();
-                t.exists = true;
-                let dedup = !producer_id.is_empty();
-                if dedup {
-                    if let Some(offset) = t.dedup.get(&(producer_id.clone(), seq)) {
-                        return AppResponse::Produced { offset: *offset };
-                    }
-                }
-                let offset = t.next_offset;
-                t.next_offset += 1;
-                t.messages.insert(
-                    offset,
-                    Message {
-                        offset,
-                        priority,
-                        content_type,
-                        payload,
-                        ts_ms,
-                    },
-                );
-                if dedup {
-                    let key = (producer_id, seq);
-                    t.dedup.insert(key.clone(), offset);
-                    t.dedup_order.push_back(key);
-                    while t.dedup_order.len() > DEDUP_CAPACITY {
-                        if let Some(old) = t.dedup_order.pop_front() {
-                            t.dedup.remove(&old);
-                        }
-                    }
-                }
-                purge_retained(t, ts_ms);
+                let offset = self.produce_one(ProduceItem {
+                    topic,
+                    priority,
+                    content_type,
+                    payload,
+                    producer_id,
+                    seq,
+                    ts_ms,
+                });
                 AppResponse::Produced { offset }
+            }
+            AppRequest::ProduceMany { items } => {
+                let offsets = items.into_iter().map(|item| self.produce_one(item)).collect();
+                AppResponse::ProducedMany { offsets }
             }
             AppRequest::Poll {
                 topic,
@@ -153,6 +152,26 @@ impl Queue {
             } => {
                 ack(&mut self.topics, &topic.0, &group.0, lease_id);
                 AppResponse::Acked
+            }
+            AppRequest::AckMany {
+                topic,
+                group,
+                lease_ids,
+            } => {
+                for lease_id in lease_ids {
+                    ack(&mut self.topics, &topic.0, &group.0, lease_id);
+                }
+                AppResponse::Acked
+            }
+            AppRequest::NackMany {
+                topic,
+                group,
+                lease_ids,
+            } => {
+                for lease_id in lease_ids {
+                    nack(&mut self.topics, &topic.0, &group.0, lease_id);
+                }
+                AppResponse::Nacked
             }
             AppRequest::Nack {
                 topic,
@@ -193,6 +212,40 @@ impl Queue {
         }
     }
 
+    fn produce_one(&mut self, item: ProduceItem) -> Offset {
+        let t = self.topics.entry(item.topic.0).or_default();
+        let dedup = !item.producer_id.is_empty();
+        if dedup {
+            if let Some(offset) = t.dedup.get(&(item.producer_id.clone(), item.seq)) {
+                return *offset;
+            }
+        }
+        let offset = t.next_offset;
+        t.next_offset += 1;
+        t.messages.insert(
+            offset,
+            Message {
+                offset,
+                priority: item.priority,
+                content_type: item.content_type,
+                payload: item.payload,
+                ts_ms: item.ts_ms,
+            },
+        );
+        if dedup {
+            let key = (item.producer_id, item.seq);
+            t.dedup.insert(key.clone(), offset);
+            t.dedup_order.push_back(key);
+            while t.dedup_order.len() > DEDUP_CAPACITY {
+                if let Some(old) = t.dedup_order.pop_front() {
+                    t.dedup.remove(&old);
+                }
+            }
+        }
+        purge_retained(t, item.ts_ms);
+        offset
+    }
+
     pub fn rate_config(&self, topic: &str) -> Option<(u64, u32)> {
         self.topics.get(topic).and_then(|t| {
             if t.rate_milli_per_sec > 0 {
@@ -209,12 +262,11 @@ impl Queue {
         };
         match t.groups.get(group) {
             None => !t.messages.is_empty(),
-            Some(g) => t.messages.keys().any(|offset| {
-                !g.is_done(*offset)
-                    && !g
-                        .in_flight
-                        .values()
-                        .any(|lease| lease.offset == *offset && lease.deadline_ms > now_ms)
+            Some(g) => t.messages.range(g.ack_watermark..).any(|(offset, _)| {
+                !g.acked_above.contains(offset)
+                    && g.leased_offsets
+                        .get(offset)
+                        .is_none_or(|deadline| *deadline <= now_ms)
             }),
         }
     }
@@ -254,13 +306,17 @@ fn poll(
     let Some(t) = topics.get_mut(topic) else {
         return Vec::new();
     };
-    let g = t.groups.entry(group.to_string()).or_default();
+    let first = t.messages.keys().next().copied().unwrap_or(t.next_offset);
+    let g = t.groups.entry(group.to_string()).or_insert_with(|| GroupState {
+        ack_watermark: first,
+        ..GroupState::default()
+    });
     g.expire(ts_ms);
 
     let max = max as usize;
     let mut candidates: Vec<(Priority, Offset)> = Vec::new();
-    for (offset, message) in t.messages.iter() {
-        if !g.is_done(*offset) && !g.leased_offsets.contains(offset) {
+    for (offset, message) in t.messages.range(g.ack_watermark..) {
+        if !g.acked_above.contains(offset) && !g.leased_offsets.contains_key(offset) {
             candidates.push((message.priority, *offset));
         }
     }
@@ -277,10 +333,9 @@ fn poll(
     let reserved = (base + bonus).min(max);
     let priority_slots = max - reserved;
 
-    let mut by_priority = candidates.clone();
+    let by_offset = candidates.clone();
+    let mut by_priority = candidates;
     by_priority.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
-    let mut by_offset = candidates;
-    by_offset.sort_by_key(|(_, offset)| *offset);
 
     let mut chosen_set: BTreeSet<Offset> = BTreeSet::new();
     let mut chosen: Vec<(Priority, Offset)> = Vec::new();
@@ -314,14 +369,9 @@ fn poll(
     for (_, offset) in chosen {
         let lease_id = *next_lease;
         *next_lease += 1;
-        g.in_flight.insert(
-            lease_id,
-            Lease {
-                offset,
-                deadline_ms: ts_ms + visibility_timeout_ms,
-            },
-        );
-        g.leased_offsets.insert(offset);
+        let deadline_ms = ts_ms.saturating_add(visibility_timeout_ms);
+        g.in_flight.insert(lease_id, Lease { offset, deadline_ms });
+        g.leased_offsets.insert(offset, deadline_ms);
         let message = &t.messages[&offset];
         items.push(Delivered {
             lease_id,
@@ -385,46 +435,32 @@ fn purge_retained(t: &mut TopicState, now_ms: u64) {
             }
         }
     }
+    if purge.is_empty() {
+        return;
+    }
     for offset in &purge {
         t.messages.remove(offset);
-        for g in t.groups.values_mut() {
-            let leases: Vec<LeaseId> = g
-                .in_flight
-                .iter()
-                .filter(|(_, lease)| lease.offset == *offset)
-                .map(|(id, _)| *id)
-                .collect();
-            for id in leases {
-                g.in_flight.remove(&id);
-            }
-            g.leased_offsets.remove(offset);
-            g.acked_above.remove(offset);
+    }
+    let boundary = t.messages.keys().next().copied().unwrap_or(t.next_offset);
+    for g in t.groups.values_mut() {
+        if boundary > g.ack_watermark {
+            g.advance_watermark(boundary);
         }
     }
 }
 
+fn group_entry<'a>(t: &'a mut TopicState, group: &str) -> &'a mut GroupState {
+    let first = t.messages.keys().next().copied().unwrap_or(t.next_offset);
+    t.groups.entry(group.to_string()).or_insert_with(|| GroupState {
+        ack_watermark: first,
+        ..GroupState::default()
+    })
+}
+
 fn commit(topics: &mut BTreeMap<String, TopicState>, topic: &str, group: &str, offset: Offset) {
     if let Some(t) = topics.get_mut(topic) {
-        let g = t.groups.entry(group.to_string()).or_default();
-        if offset > g.ack_watermark {
-            g.ack_watermark = offset;
-        }
-        let watermark = g.ack_watermark;
-        g.acked_above.retain(|o| *o >= watermark);
-        let drop: Vec<LeaseId> = g
-            .in_flight
-            .iter()
-            .filter(|(_, l)| l.offset < watermark)
-            .map(|(id, _)| *id)
-            .collect();
-        for id in drop {
-            if let Some(l) = g.in_flight.remove(&id) {
-                g.leased_offsets.remove(&l.offset);
-            }
-        }
-        while g.acked_above.remove(&g.ack_watermark) {
-            g.ack_watermark += 1;
-        }
+        let g = group_entry(t, group);
+        g.advance_watermark(offset);
     }
 }
 
@@ -611,6 +647,100 @@ mod tests {
             .map(|(_, o)| o)
             .collect();
         assert_eq!(offsets, vec![1]);
+    }
+
+    #[test]
+    fn retention_purge_advances_watermark_and_releases_ack_tracking() {
+        let mut q = Queue::default();
+        q.apply(AppRequest::SetRetention {
+            topic: TopicId::from("t"),
+            max_messages: 3,
+            max_age_ms: 0,
+        });
+        produce(&mut q, "t", 0, b"seed", "", 0);
+        poll_offsets(&mut q, "t", "g", 1, 1, 0);
+        for i in 0..5 {
+            produce(&mut q, "t", 0, &[i], "", 0);
+        }
+        let leased = poll_offsets(&mut q, "t", "g", 10, 1000, 10);
+        let offsets: Vec<Offset> = leased.iter().map(|(_, o)| *o).collect();
+        assert_eq!(offsets, vec![3, 4, 5]);
+        for (lease_id, _) in leased {
+            q.apply(AppRequest::Ack {
+                topic: TopicId::from("t"),
+                group: GroupId::from("g"),
+                lease_id,
+            });
+        }
+        let g = &q.topics["t"].groups["g"];
+        assert_eq!(g.ack_watermark, 6, "watermark must advance past purged offsets");
+        assert!(g.acked_above.is_empty(), "acked_above must drain once the watermark advances");
+        assert!(g.in_flight.is_empty());
+        assert!(g.leased_offsets.is_empty());
+    }
+
+    #[test]
+    fn produce_many_assigns_offsets_in_order_and_dedups() {
+        let mut q = Queue::default();
+        let item = |payload: &[u8], producer: &str, seq: u64| ProduceItem {
+            topic: TopicId::from("t"),
+            priority: Priority(0),
+            content_type: ContentType::Raw,
+            payload: payload.to_vec(),
+            producer_id: producer.to_string(),
+            seq,
+            ts_ms: 0,
+        };
+        let resp = q.apply(AppRequest::ProduceMany {
+            items: vec![
+                item(b"a", "p", 1),
+                item(b"b", "p", 2),
+                item(b"a-retry", "p", 1),
+                item(b"c", "", 0),
+            ],
+        });
+        match resp {
+            AppResponse::ProducedMany { offsets } => {
+                assert_eq!(offsets, vec![0, 1, 0, 2], "dedup inside a batch must return the original offset");
+            }
+            other => panic!("expected ProducedMany, got {other:?}"),
+        }
+        let polled = poll_offsets(&mut q, "t", "g", 10, 1000, 0);
+        assert_eq!(polled.len(), 3, "the dedup re-send must not create a fourth message");
+    }
+
+    #[test]
+    fn ack_many_acks_all_leases() {
+        let mut q = Queue::default();
+        for i in 0..3 {
+            produce(&mut q, "t", 0, &[i], "", 0);
+        }
+        let leased = poll_offsets(&mut q, "t", "g", 10, 1000, 0);
+        let lease_ids: Vec<LeaseId> = leased.iter().map(|(id, _)| *id).collect();
+        q.apply(AppRequest::AckMany {
+            topic: TopicId::from("t"),
+            group: GroupId::from("g"),
+            lease_ids,
+        });
+        let after = poll_offsets(&mut q, "t", "g", 10, 1000, 5000);
+        assert!(after.is_empty(), "all leases must be acked in one request");
+    }
+
+    #[test]
+    fn nack_many_releases_all_leases() {
+        let mut q = Queue::default();
+        for i in 0..3 {
+            produce(&mut q, "t", 0, &[i], "", 0);
+        }
+        let leased = poll_offsets(&mut q, "t", "g", 10, 1000, 0);
+        let lease_ids: Vec<LeaseId> = leased.iter().map(|(id, _)| *id).collect();
+        q.apply(AppRequest::NackMany {
+            topic: TopicId::from("t"),
+            group: GroupId::from("g"),
+            lease_ids,
+        });
+        let again = poll_offsets(&mut q, "t", "g", 10, 1000, 1);
+        assert_eq!(again.len(), 3, "nacked messages must be immediately redeliverable");
     }
 
     #[test]

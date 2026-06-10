@@ -1,9 +1,11 @@
+use std::collections::BTreeMap;
 use std::fmt::Debug;
 use std::ops::{Bound, RangeBounds};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use openraft::storage::{LogFlushed, RaftLogReader, RaftLogStorage};
 use openraft::{Entry, LogId, LogState, OptionalSend, StorageError, Vote};
+use tokio::sync::{mpsc, oneshot};
 
 use super::{dec, enc, sread, swrite};
 use crate::raft::TypeConfig;
@@ -12,22 +14,116 @@ use crate::types::NodeId;
 use crate::RedbStore;
 
 const KEY_PURGED: &str = "log:purged";
+const FLUSH_MAX_ENTRIES: usize = 512;
+const FLUSH_MAX_BYTES: usize = 8 * 1024 * 1024;
+
+enum FlushJob {
+    Append(Vec<(u64, Vec<u8>)>, LogFlushed<TypeConfig>),
+    Barrier(oneshot::Sender<()>),
+}
+
+struct Shared<S> {
+    db: Arc<S>,
+    pending: Mutex<BTreeMap<u64, Vec<u8>>>,
+}
 
 pub struct LogStore<S = RedbStore> {
-    db: Arc<S>,
+    shared: Arc<Shared<S>>,
+    jobs: mpsc::UnboundedSender<FlushJob>,
 }
 
 impl<S> Clone for LogStore<S> {
     fn clone(&self) -> Self {
         Self {
-            db: Arc::clone(&self.db),
+            shared: Arc::clone(&self.shared),
+            jobs: self.jobs.clone(),
         }
     }
 }
 
-impl<S> LogStore<S> {
+impl<S: Storage> LogStore<S> {
     pub fn new(db: Arc<S>) -> Self {
-        Self { db }
+        let shared = Arc::new(Shared {
+            db,
+            pending: Mutex::new(BTreeMap::new()),
+        });
+        let (jobs, rx) = mpsc::unbounded_channel();
+        let flusher = Arc::clone(&shared);
+        std::thread::spawn(move || run_flusher(flusher, rx));
+        Self { shared, jobs }
+    }
+
+    async fn barrier(&self) {
+        let (tx, rx) = oneshot::channel();
+        if self.jobs.send(FlushJob::Barrier(tx)).is_ok() {
+            let _ = rx.await;
+        }
+    }
+
+    fn pending_last(&self) -> Option<u64> {
+        self.shared
+            .pending
+            .lock()
+            .unwrap()
+            .keys()
+            .next_back()
+            .copied()
+    }
+}
+
+fn run_flusher<S: Storage>(shared: Arc<Shared<S>>, mut rx: mpsc::UnboundedReceiver<FlushJob>) {
+    while let Some(first) = rx.blocking_recv() {
+        let mut batch: Vec<(u64, Vec<u8>)> = Vec::new();
+        let mut callbacks = Vec::new();
+        let mut barriers = Vec::new();
+        let mut bytes = 0usize;
+        let mut job = Some(first);
+        loop {
+            match job {
+                Some(FlushJob::Append(entries, callback)) => {
+                    bytes += entries.iter().map(|(_, b)| b.len()).sum::<usize>();
+                    batch.extend(entries);
+                    callbacks.push(callback);
+                }
+                Some(FlushJob::Barrier(done)) => {
+                    barriers.push(done);
+                    break;
+                }
+                None => break,
+            }
+            if batch.len() >= FLUSH_MAX_ENTRIES || bytes >= FLUSH_MAX_BYTES {
+                break;
+            }
+            job = rx.try_recv().ok();
+        }
+
+        let result = if batch.is_empty() {
+            Ok(())
+        } else {
+            shared.db.append_log(&batch)
+        };
+        match result {
+            Ok(()) => {
+                if !batch.is_empty() {
+                    let mut pending = shared.pending.lock().unwrap();
+                    for (index, _) in &batch {
+                        pending.remove(index);
+                    }
+                }
+                for callback in callbacks {
+                    callback.log_io_completed(Ok(()));
+                }
+            }
+            Err(e) => {
+                let msg = e.to_string();
+                for callback in callbacks {
+                    callback.log_io_completed(Err(std::io::Error::other(msg.clone())));
+                }
+            }
+        }
+        for done in barriers {
+            let _ = done.send(());
+        }
     }
 }
 
@@ -44,18 +140,30 @@ impl<S: Storage> RaftLogReader<TypeConfig> for LogStore<S> {
         let end = match range.end_bound() {
             Bound::Included(x) => *x + 1,
             Bound::Excluded(x) => *x,
-            Bound::Unbounded => self
-                .db
-                .last_log_index()
-                .map_err(sread)?
-                .map(|i| i + 1)
-                .unwrap_or(0),
+            Bound::Unbounded => {
+                let db_last = self.shared.db.last_log_index().map_err(sread)?;
+                db_last
+                    .into_iter()
+                    .chain(self.pending_last())
+                    .max()
+                    .map(|i| i + 1)
+                    .unwrap_or(0)
+            }
         };
 
-        let raw = self.db.read_log(start, end).map_err(sread)?;
-        let mut out = Vec::with_capacity(raw.len());
-        for (_, bytes) in raw {
-            out.push(dec::<Entry<TypeConfig>>(&bytes)?);
+        let mut merged: BTreeMap<u64, Vec<u8>> = BTreeMap::new();
+        for (index, bytes) in self.shared.db.read_log(start, end).map_err(sread)? {
+            merged.insert(index, bytes);
+        }
+        {
+            let pending = self.shared.pending.lock().unwrap();
+            for (index, bytes) in pending.range(start..end) {
+                merged.insert(*index, bytes.clone());
+            }
+        }
+        let mut out = Vec::with_capacity(merged.len());
+        for bytes in merged.values() {
+            out.push(dec::<Entry<TypeConfig>>(bytes)?);
         }
         Ok(out)
     }
@@ -65,19 +173,32 @@ impl<S: Storage> RaftLogStorage<TypeConfig> for LogStore<S> {
     type LogReader = Self;
 
     async fn get_log_state(&mut self) -> Result<LogState<TypeConfig>, StorageError<NodeId>> {
-        let last_purged: Option<LogId<NodeId>> = match self.db.get(KEY_PURGED).map_err(sread)? {
+        let last_purged: Option<LogId<NodeId>> = match self.shared.db.get(KEY_PURGED).map_err(sread)? {
             Some(b) => Some(dec(&b)?),
             None => None,
         };
 
-        let last_log_id = match self.db.last_log_index().map_err(sread)? {
-            Some(i) => {
-                let raw = self.db.read_log(i, i + 1).map_err(sread)?;
-                match raw.into_iter().next() {
-                    Some((_, bytes)) => {
-                        let entry: Entry<TypeConfig> = dec(&bytes)?;
-                        Some(entry.log_id)
-                    }
+        let db_last = self.shared.db.last_log_index().map_err(sread)?;
+        let last_index = db_last.into_iter().chain(self.pending_last()).max();
+        let last_log_id = match last_index {
+            Some(index) => {
+                let bytes = {
+                    let pending = self.shared.pending.lock().unwrap();
+                    pending.get(&index).cloned()
+                };
+                let bytes = match bytes {
+                    Some(b) => Some(b),
+                    None => self
+                        .shared
+                        .db
+                        .read_log(index, index + 1)
+                        .map_err(sread)?
+                        .into_iter()
+                        .next()
+                        .map(|(_, b)| b),
+                };
+                match bytes {
+                    Some(b) => Some(dec::<Entry<TypeConfig>>(&b)?.log_id),
                     None => last_purged,
                 }
             }
@@ -96,11 +217,11 @@ impl<S: Storage> RaftLogStorage<TypeConfig> for LogStore<S> {
 
     async fn save_vote(&mut self, vote: &Vote<NodeId>) -> Result<(), StorageError<NodeId>> {
         let bytes = enc(vote)?;
-        self.db.save_vote(&bytes).map_err(swrite)
+        self.shared.db.save_vote(&bytes).map_err(swrite)
     }
 
     async fn read_vote(&mut self) -> Result<Option<Vote<NodeId>>, StorageError<NodeId>> {
-        match self.db.read_vote().map_err(sread)? {
+        match self.shared.db.read_vote().map_err(sread)? {
             Some(b) => Ok(Some(dec(&b)?)),
             None => Ok(None),
         }
@@ -111,11 +232,11 @@ impl<S: Storage> RaftLogStorage<TypeConfig> for LogStore<S> {
         committed: Option<LogId<NodeId>>,
     ) -> Result<(), StorageError<NodeId>> {
         let bytes = enc(&committed)?;
-        self.db.save_committed(&bytes).map_err(swrite)
+        self.shared.db.save_committed(&bytes).map_err(swrite)
     }
 
     async fn read_committed(&mut self) -> Result<Option<LogId<NodeId>>, StorageError<NodeId>> {
-        match self.db.read_committed().map_err(sread)? {
+        match self.shared.db.read_committed().map_err(sread)? {
             Some(b) => dec::<Option<LogId<NodeId>>>(&b),
             None => Ok(None),
         }
@@ -132,21 +253,36 @@ impl<S: Storage> RaftLogStorage<TypeConfig> for LogStore<S> {
     {
         let mut batch = Vec::new();
         for entry in entries {
-            let index = entry.log_id.index;
-            batch.push((index, enc(&entry)?));
+            batch.push((entry.log_id.index, enc(&entry)?));
         }
-        self.db.append_log(&batch).map_err(swrite)?;
-        callback.log_io_completed(Ok(()));
+        {
+            let mut pending = self.shared.pending.lock().unwrap();
+            for (index, bytes) in &batch {
+                pending.insert(*index, bytes.clone());
+            }
+        }
+        if self.jobs.send(FlushJob::Append(batch, callback)).is_err() {
+            return Err(swrite("log flusher thread is gone"));
+        }
         Ok(())
     }
 
     async fn truncate(&mut self, log_id: LogId<NodeId>) -> Result<(), StorageError<NodeId>> {
-        self.db.truncate_log_from(log_id.index).map_err(swrite)
+        self.barrier().await;
+        self.shared
+            .pending
+            .lock()
+            .unwrap()
+            .split_off(&log_id.index);
+        self.shared
+            .db
+            .truncate_log_from(log_id.index)
+            .map_err(swrite)
     }
 
     async fn purge(&mut self, log_id: LogId<NodeId>) -> Result<(), StorageError<NodeId>> {
         let bytes = enc(&log_id)?;
-        self.db.put(KEY_PURGED, &bytes).map_err(swrite)?;
-        self.db.purge_log_upto(log_id.index).map_err(swrite)
+        self.shared.db.put(KEY_PURGED, &bytes).map_err(swrite)?;
+        self.shared.db.purge_log_upto(log_id.index).map_err(swrite)
     }
 }

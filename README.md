@@ -1,9 +1,6 @@
 # HermesMQ
 
-A **Raft-replicated message queue**. A cluster of nodes runs Raft
-([openraft](https://github.com/datafuselabs/openraft)); produces, acks, and consumer offsets all go
-through the replicated log, so the queue survives node failure. Clients talk a compact
-length-prefixed **TCP + Protobuf** protocol.
+A **Raft-replicated message queue**.
 
 Status: **in progress**
 
@@ -15,6 +12,7 @@ Status: **in progress**
 - [x] Two consume styles — server **push** (`subscribe`, no client loop) or **pull** (`poll`, long-poll)
 - [x] Per-group consumer offsets + in-flight (leased) tracking with visibility timeout
 - [x] At-least-once (default) or at-most-once via per-subscription `ack_mode`; `ack`/`nack` + redelivery
+- [x] Consumer-side dedup on `subscribe` — slow handlers get lease auto-refresh instead of same-connection duplicates; late acks still count
 - [x] 8-level priority with reserved-fraction anti-starvation
 - [x] Cluster-wide rate limits (token bucket per topic; `rate` may be < 1/s)
 - [x] Retention by message count and/or age
@@ -22,6 +20,14 @@ Status: **in progress**
 - [x] Configuration via the client (topics, rate limits, retention)
 - [x] Observability — `/health`, `/ready`, Prometheus `/metrics`
 - [x] Pure-Rust build — no `protoc` (protobuf codegen via `protox` + `prost-build`)
+
+## Highly subjective performance (0.2.0)
+
+...testing on local machine, w/o network, etc. bottlenecks
+
+![HermesMQ performance](performance.png)
+
+The chart is regenerated from the measured numbers on every `cargo perf` run.
 
 ## Workspace layout
 
@@ -36,7 +42,7 @@ Status: **in progress**
 
 ```sh
 cargo build --release
-cargo test            # 33 tests: unit + client-protocol + cluster + durability + http + slow-disk
+cargo test # unit + client-protocol + cluster + durability + http + slow-disk
 ```
 
 ## Run a node
@@ -54,13 +60,17 @@ A freshly started node waits for a **client to bootstrap** it. For a multi-node 
 node (no special flags), then have a client send a `Bootstrap` with the full node list (the Node
 addon's `connect()` does this automatically).
 
-| Flag | Default | Purpose |
-|---|---|---|
-| `--node-id` | `1` | Unique node id |
-| `--data-dir` | `data` | redb data directory |
-| `--client-addr` | `127.0.0.1:7600` | Client protobuf/TCP listener |
-| `--peer-addr` | `127.0.0.1:7700` | Inter-node Raft RPC listener |
-| `--metrics-addr` | `127.0.0.1:9600` | HTTP `/health` `/ready` `/metrics` |
+| Flag | Env var | Default | Purpose |
+|---|---|---|---|
+| `--node-id` | `HERMESMQ_NODE_ID` | `1` | Unique node id |
+| `--data-dir` | `HERMESMQ_DATA_DIR` | `data` | redb data directory |
+| `--client-addr` | `HERMESMQ_CLIENT_ADDR` | `127.0.0.1:7600` | Client protobuf/TCP listener |
+| `--peer-addr` | `HERMESMQ_PEER_ADDR` | `127.0.0.1:7700` | Inter-node Raft RPC listener |
+| `--metrics-addr` | `HERMESMQ_METRICS_ADDR` | `127.0.0.1:9600` | HTTP `/health` `/ready` `/metrics` |
+
+Every flag can also be set via its environment variable; a CLI flag takes precedence. The Docker
+image bakes in container-appropriate defaults (`0.0.0.0` listeners, `/data` data dir), so a
+container only needs `HERMESMQ_NODE_ID`.
 
 Environment variable `RUST_LOG` controls log verbosity (e.g. `RUST_LOG=info`). Example `- RUST_LOG=info,openraft=warn`
 
@@ -68,7 +78,7 @@ Environment variable `RUST_LOG` controls log verbosity (e.g. `RUST_LOG=info`). E
 
 ```sh
 docker compose up -d --build
-docker compose ps          # all three healthy
+docker compose ps # all three healthy
 ```
 
 This starts `hermesmq1/2/3` (client ports `7600/7601/7602`, metrics `9600/9601/9602`); a client
@@ -225,7 +235,25 @@ Length-prefixed frames (`u32` big-endian length + Protobuf body). One `Request`/
 `poll`, `subscribe`, `ack`, `nack`, `commit`, `create_topic`, `delete_topic`, `set_rate_limit`,
 `set_retention`, `stats`. `subscribe` takes over its connection: the leader pushes `Delivered`
 frames and reads `ack`/`nack` frames back on the same socket. Inter-node Raft RPC uses the same
-framing with postcard-encoded openraft messages.
+framing with postcard-encoded openraft messages (one persistent connection per peer).
+
+Server-side limits and defaults (applied when a field is `0`): produce payloads are capped at
+**1 MiB** (`payload_too_large` otherwise), poll `max` defaults to 16 (capped at 1024),
+`visibility_timeout_ms` defaults to 30 000, `wait_ms` is capped at 300 000, and `priority` is
+clamped to 0–7. `not_leader` errors include the current leader's peer address in `leader_addr`
+when one is known.
+
+Requests may be **pipelined**: a client can send further frames without waiting for responses
+(up to 32 are processed concurrently per connection; beyond that, TCP backpressure applies).
+Responses are always written in request order — there are no request ids. Pipelined produces are
+processed concurrently, so their offsets may not match submission order; don't pipeline a
+long-poll ahead of requests whose responses you need promptly. A `subscribe` frame waits for all
+pending responses to drain, then takes over the connection as before.
+
+Concurrent produces (pipelined or across connections) are **group-committed**: the node coalesces
+them into a single replicated log entry and one fsync, so produce throughput scales with the
+number of in-flight requests instead of paying a full Raft round per message. A produce only ever
+returns after its batch is durable and replicated — semantics are unchanged.
 
 ## Observability
 
@@ -240,6 +268,13 @@ framing with postcard-encoded openraft messages.
   (pull). If a lease's visibility timeout expires without an ack, the message is redelivered — so
   consumers must be **idempotent**. Both paths preserve priority ordering and per-`(topic, group)`
   redelivery.
+- **Consumer-side dedup (`subscribe`)**: while a subscription connection is alive, a message whose
+  visibility timeout expires mid-handler is **not** re-pushed to that connection — the server
+  auto-refreshes the lease (up to 2 times) and a late ack for the original lease still completes
+  the message. After the refresh cap (~3× `visibilityMs`) the message is redelivered as usual, and
+  if the connection dies its leases expire normally — at-least-once is preserved, so consumers must
+  still be idempotent across reconnects and consumer failover. Pull (`poll`) consumers can dedup by
+  `offset`.
 - **At-most-once**: `subscribe` with `ackMode: "auto"`, or `poll` with `ackMode: "auto"` — acked on
   delivery.
 - **Dedup**: provide `producer_id`/`seq`; re-sends within the dedup window return the original offset.
@@ -252,9 +287,36 @@ framing with postcard-encoded openraft messages.
 3-node replication, leader/follower loss, quorum-loss safety, network partition + heal, on-disk
 restart durability, slow-disk tolerance, and the HTTP endpoints.
 
+### End-to-end (Docker)
+
+```sh
+cargo e2e
+```
+
+This is **one test that runs a full cluster lifecycle** (so the runner reports `1 passed` —
+that's expected), printing its progress step by step (`[e2e   12.3s] ...`): it builds the image,
+starts a dedicated 3-node compose cluster (`docker-compose.e2e.yml`, host ports 17600-17602 /
+19600-19602), bootstraps it over the wire, exercises produce/dedup/priority/poll/ack, kills the
+leader container, verifies failover and that un-acked messages survive, restarts the killed node,
+waits for catch-up, checks `/metrics`, and tears the cluster down (also on failure). Requires
+Docker with compose v2. The first run builds the image and can take several minutes; later runs
+reuse the Docker cache. (`cargo e2e` is an alias from `.cargo/config.toml` for
+`cargo test -p hermesmq-core --test e2e_docker -- --ignored --nocapture`.)
+
+### Performance
+
+```sh
+cargo perf
+```
+
+Prints throughput and latency percentiles, and asserts loose floors (release builds only) to catch
+catastrophic regressions: queue state-machine ops, sequential / concurrent / pipelined produce
+against a single fsync-backed node, poll/ack drain, subscribe push, and 3-node replicated writes.
+(Alias for `cargo test -p hermesmq-core --release --test perf -- --ignored --nocapture --test-threads=1`.)
+
 ## Caveats
 
-- The TCP and peer-RPC ports have **no auth/TLS** yet — only run on a trusted/private network. Add a
+- The TCP and peer-RPC ports have **no auth/TLS** — only run on a trusted/private network. Add a
   token + TLS before any untrusted exposure, and firewall the peer port to cluster hosts only.
 - Retention is **Kafka-style**: it drops messages by age/size regardless of consumption, so a lagging
   group can lose un-consumed messages. Set generous retention if that matters.

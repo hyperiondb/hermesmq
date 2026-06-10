@@ -53,6 +53,30 @@ pub enum AppRequest {
         max_messages: u64,
         max_age_ms: u64,
     },
+    AckMany {
+        topic: TopicId,
+        group: GroupId,
+        lease_ids: Vec<LeaseId>,
+    },
+    ProduceMany {
+        items: Vec<ProduceItem>,
+    },
+    NackMany {
+        topic: TopicId,
+        group: GroupId,
+        lease_ids: Vec<LeaseId>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProduceItem {
+    pub topic: TopicId,
+    pub priority: Priority,
+    pub content_type: ContentType,
+    pub payload: Vec<u8>,
+    pub producer_id: String,
+    pub seq: u64,
+    pub ts_ms: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -77,6 +101,7 @@ pub enum AppResponse {
     RateLimitSet,
     RetentionSet,
     NoOp,
+    ProducedMany { offsets: Vec<Offset> },
 }
 
 openraft::declare_raft_types!(

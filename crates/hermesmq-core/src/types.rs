@@ -36,12 +36,6 @@ impl std::fmt::Display for GroupId {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct MessageId {
-    pub topic: TopicId,
-    pub offset: Offset,
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Default, Serialize, Deserialize)]
 pub struct Priority(pub u8);
 
@@ -52,16 +46,6 @@ pub enum ContentType {
     Text,
     Json,
     MsgPack,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct AckMode(pub AckModeKind);
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
-pub enum AckModeKind {
-    #[default]
-    Manual,
-    Auto,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

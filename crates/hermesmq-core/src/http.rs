@@ -24,12 +24,26 @@ pub async fn serve_http(raft: HermesRaft, sm: StateMachineStore, listener: TcpLi
 }
 
 async fn handle(raft: HermesRaft, sm: StateMachineStore, mut stream: TcpStream) -> io::Result<()> {
-    let mut buf = [0u8; 1024];
-    let n = stream.read(&mut buf).await?;
-    let head = String::from_utf8_lossy(&buf[..n]);
-    let path = head
+    let mut buf = Vec::with_capacity(1024);
+    let mut chunk = [0u8; 1024];
+    loop {
+        let n = stream.read(&mut chunk).await?;
+        if n == 0 {
+            break;
+        }
+        buf.extend_from_slice(&chunk[..n]);
+        if buf.windows(2).any(|w| w == b"\r\n") || buf.len() >= 8192 {
+            break;
+        }
+    }
+    let head = String::from_utf8_lossy(&buf);
+    let request_line = head.lines().next().unwrap_or("");
+    let path = request_line
         .split_whitespace()
         .nth(1)
+        .unwrap_or("/")
+        .split('?')
+        .next()
         .unwrap_or("/")
         .to_string();
 

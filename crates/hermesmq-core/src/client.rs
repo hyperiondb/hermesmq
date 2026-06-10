@@ -1,19 +1,132 @@
 use std::collections::{BTreeMap, HashMap};
 use std::io;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use openraft::error::{ClientWriteError, InitializeError, RaftError};
 use openraft::BasicNode;
 use prost::Message;
+use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::Notify;
+use tokio::sync::{mpsc, oneshot, Notify};
 
 use crate::engine::{HermesRaft, StateMachineStore};
 use crate::frame::{read_frame, write_frame};
-use crate::raft::{AppRequest, AppResponse, Delivered};
-use crate::types::{ContentType, GroupId, NodeId, Priority, TopicId};
+use crate::raft::{AppRequest, AppResponse, Delivered, ProduceItem};
+use crate::types::{ContentType, GroupId, LeaseId, NodeId, Offset, Priority, TopicId};
+
+pub const MAX_PAYLOAD_BYTES: usize = 1024 * 1024;
+const DEFAULT_POLL_MAX: u32 = 16;
+const MAX_POLL_MAX: u32 = 1024;
+const DEFAULT_VISIBILITY_MS: u64 = 30_000;
+const MAX_WAIT_MS: u64 = 300_000;
+const MAX_PRIORITY: u32 = 7;
+const SUBSCRIBE_MAX_LEASE_REFRESHES: u32 = 2;
+const SUBSCRIBE_MAX_LEASE_ALIASES: usize = 8;
+const PIPELINE_DEPTH: usize = 32;
+const PRODUCE_QUEUE_DEPTH: usize = 1024;
+const PRODUCE_BATCH_MAX_ITEMS: usize = 256;
+const PRODUCE_BATCH_MAX_BYTES: usize = 512 * 1024;
+const ACK_QUEUE_DEPTH: usize = 1024;
+const ACK_BATCH_MAX: usize = 1024;
+const ACK_GRACE_MS: u64 = 5_000;
+
+struct OffsetTrack {
+    lease_id: LeaseId,
+    deadline_ms: u64,
+    refreshes: u32,
+    leases: Vec<LeaseId>,
+}
+
+enum Delivery {
+    Push,
+    Refreshed,
+    AlreadyAcked,
+}
+
+#[derive(Default)]
+struct SubTracking {
+    by_offset: HashMap<Offset, OffsetTrack>,
+    lease_to_offset: HashMap<LeaseId, Offset>,
+    acked_recently: HashMap<Offset, u64>,
+}
+
+impl SubTracking {
+    fn deliver(&mut self, offset: Offset, lease_id: LeaseId, deadline_ms: u64, now_ms: u64) -> Delivery {
+        if let Some(until) = self.acked_recently.get(&offset) {
+            if *until > now_ms {
+                return Delivery::AlreadyAcked;
+            }
+            self.acked_recently.remove(&offset);
+        }
+        match self.by_offset.get_mut(&offset) {
+            Some(track) => {
+                let refresh = track.refreshes < SUBSCRIBE_MAX_LEASE_REFRESHES;
+                track.refreshes = if refresh { track.refreshes + 1 } else { 0 };
+                track.lease_id = lease_id;
+                track.deadline_ms = deadline_ms;
+                track.leases.push(lease_id);
+                if track.leases.len() > SUBSCRIBE_MAX_LEASE_ALIASES {
+                    let old = track.leases.remove(0);
+                    self.lease_to_offset.remove(&old);
+                }
+                self.lease_to_offset.insert(lease_id, offset);
+                if refresh {
+                    Delivery::Refreshed
+                } else {
+                    Delivery::Push
+                }
+            }
+            None => {
+                self.by_offset.insert(
+                    offset,
+                    OffsetTrack {
+                        lease_id,
+                        deadline_ms,
+                        refreshes: 0,
+                        leases: vec![lease_id],
+                    },
+                );
+                self.lease_to_offset.insert(lease_id, offset);
+                Delivery::Push
+            }
+        }
+    }
+
+    fn resolve(&mut self, lease_id: LeaseId, acked_until: Option<u64>) -> Option<LeaseId> {
+        let offset = self.lease_to_offset.get(&lease_id).copied()?;
+        let track = self.by_offset.remove(&offset)?;
+        for lease in &track.leases {
+            self.lease_to_offset.remove(lease);
+        }
+        if let Some(until) = acked_until {
+            self.acked_recently.insert(offset, until);
+        }
+        Some(track.lease_id)
+    }
+
+    fn live_count(&mut self, now_ms: u64, grace_ms: u64) -> usize {
+        self.acked_recently.retain(|_, until| *until > now_ms);
+        let stale: Vec<Offset> = self
+            .by_offset
+            .iter()
+            .filter(|(_, t)| t.deadline_ms.saturating_add(grace_ms) <= now_ms)
+            .map(|(offset, _)| *offset)
+            .collect();
+        for offset in stale {
+            if let Some(track) = self.by_offset.remove(&offset) {
+                for lease in &track.leases {
+                    self.lease_to_offset.remove(lease);
+                }
+            }
+        }
+        self.by_offset
+            .values()
+            .filter(|t| t.deadline_ms > now_ms)
+            .count()
+    }
+}
 
 struct Bucket {
     tokens: f64,
@@ -49,6 +162,23 @@ impl RateLimiter {
             Err(retry_ms)
         }
     }
+
+    fn forget(&self, topic: &str) {
+        self.buckets.lock().unwrap().remove(topic);
+    }
+}
+
+struct ProduceJob {
+    p: proto::Produce,
+    reply: oneshot::Sender<Response>,
+}
+
+struct AckJob {
+    topic: String,
+    group: String,
+    lease_id: LeaseId,
+    nack: bool,
+    reply: Option<oneshot::Sender<Response>>,
 }
 
 #[derive(Clone)]
@@ -57,6 +187,8 @@ struct Ctx {
     sm: StateMachineStore,
     limiter: Arc<RateLimiter>,
     notifiers: Arc<StdMutex<HashMap<String, Arc<Notify>>>>,
+    produce_tx: mpsc::Sender<ProduceJob>,
+    ack_tx: mpsc::Sender<AckJob>,
 }
 
 impl Ctx {
@@ -178,6 +310,9 @@ fn app_response_to_proto(r: AppResponse) -> Response {
         | AppResponse::RateLimitSet
         | AppResponse::RetentionSet
         | AppResponse::NoOp => resp_ok(),
+        AppResponse::ProducedMany { .. } => {
+            resp_error("internal", "unexpected batched produce response".to_string())
+        }
     }
 }
 
@@ -188,39 +323,175 @@ async fn write_and_map(raft: &HermesRaft, app: AppRequest) -> Response {
     }
 }
 
+fn leader_addr(raft: &HermesRaft) -> String {
+    let metrics = raft.metrics();
+    let m = metrics.borrow();
+    m.current_leader
+        .and_then(|id| {
+            m.membership_config
+                .membership()
+                .get_node(&id)
+                .map(|n| n.addr.clone())
+        })
+        .unwrap_or_default()
+}
+
 async fn handle_produce(ctx: &Ctx, p: proto::Produce) -> Response {
-    let topic = p.topic.clone();
-    let resp = write_and_map(
-        &ctx.raft,
-        AppRequest::Produce {
-            topic: TopicId(p.topic),
-            priority: Priority(p.priority as u8),
-            content_type: ct_from_u32(p.content_type),
-            payload: p.payload,
-            producer_id: p.producer_id,
-            seq: p.seq,
-            ts_ms: now_ms(),
-        },
-    )
-    .await;
-    if matches!(resp.kind, Some(response::Kind::Produced(_))) {
-        ctx.notifier(&topic).notify_waiters();
+    if p.payload.len() > MAX_PAYLOAD_BYTES {
+        return resp_error(
+            "payload_too_large",
+            format!("payload is {} bytes; max is {MAX_PAYLOAD_BYTES}", p.payload.len()),
+        );
     }
-    resp
+    if let Some((rate_milli, burst)) = ctx.sm.rate_config(&p.topic) {
+        let rate = rate_milli as f64 / 1000.0;
+        if let Err(retry_after_ms) = ctx.limiter.check(&p.topic, rate, burst.max(1) as f64) {
+            return resp_rate_limited(retry_after_ms);
+        }
+    }
+    let (reply, reply_rx) = oneshot::channel();
+    if ctx.produce_tx.send(ProduceJob { p, reply }).await.is_err() {
+        return resp_error("internal", "produce batcher unavailable".to_string());
+    }
+    match reply_rx.await {
+        Ok(resp) => resp,
+        Err(_) => resp_error("internal", "produce batcher dropped the request".to_string()),
+    }
+}
+
+async fn produce_batcher(
+    raft: HermesRaft,
+    notifiers: Arc<StdMutex<HashMap<String, Arc<Notify>>>>,
+    mut rx: mpsc::Receiver<ProduceJob>,
+) {
+    while let Some(first) = rx.recv().await {
+        let mut jobs = vec![first];
+        let mut bytes = jobs[0].p.payload.len();
+        while jobs.len() < PRODUCE_BATCH_MAX_ITEMS && bytes < PRODUCE_BATCH_MAX_BYTES {
+            match rx.try_recv() {
+                Ok(job) => {
+                    bytes += job.p.payload.len();
+                    jobs.push(job);
+                }
+                Err(_) => break,
+            }
+        }
+
+        let ts_ms = now_ms();
+        let mut items = Vec::with_capacity(jobs.len());
+        let mut replies = Vec::with_capacity(jobs.len());
+        let mut topics: Vec<String> = Vec::new();
+        for job in jobs {
+            if !topics.contains(&job.p.topic) {
+                topics.push(job.p.topic.clone());
+            }
+            items.push(ProduceItem {
+                topic: TopicId(job.p.topic),
+                priority: Priority(job.p.priority.min(MAX_PRIORITY) as u8),
+                content_type: ct_from_u32(job.p.content_type),
+                payload: job.p.payload,
+                producer_id: job.p.producer_id,
+                seq: job.p.seq,
+                ts_ms,
+            });
+            replies.push(job.reply);
+        }
+
+        match raft.client_write(AppRequest::ProduceMany { items }).await {
+            Ok(resp) => match resp.data {
+                AppResponse::ProducedMany { offsets } => {
+                    for (reply, offset) in replies.into_iter().zip(offsets) {
+                        let _ = reply.send(Response {
+                            kind: Some(response::Kind::Produced(proto::Produced { offset })),
+                        });
+                    }
+                    let map = notifiers.lock().unwrap();
+                    for topic in &topics {
+                        if let Some(notifier) = map.get(topic) {
+                            notifier.notify_waiters();
+                        }
+                    }
+                }
+                other => {
+                    let resp = resp_error("internal", format!("unexpected batch response: {other:?}"));
+                    for reply in replies {
+                        let _ = reply.send(resp.clone());
+                    }
+                }
+            },
+            Err(e) => {
+                let resp = map_raft_error(e);
+                for reply in replies {
+                    let _ = reply.send(resp.clone());
+                }
+            }
+        }
+    }
+}
+
+type AckGroup = (Vec<LeaseId>, Vec<oneshot::Sender<Response>>);
+
+async fn ack_batcher(raft: HermesRaft, mut rx: mpsc::Receiver<AckJob>) {
+    while let Some(first) = rx.recv().await {
+        let mut jobs = vec![first];
+        while jobs.len() < ACK_BATCH_MAX {
+            match rx.try_recv() {
+                Ok(job) => jobs.push(job),
+                Err(_) => break,
+            }
+        }
+
+        let mut groups: BTreeMap<(String, String, bool), AckGroup> = BTreeMap::new();
+        for job in jobs {
+            let entry = groups.entry((job.topic, job.group, job.nack)).or_default();
+            entry.0.push(job.lease_id);
+            if let Some(reply) = job.reply {
+                entry.1.push(reply);
+            }
+        }
+
+        for ((topic, group, nack), (lease_ids, replies)) in groups {
+            let app = if nack {
+                AppRequest::NackMany {
+                    topic: TopicId(topic),
+                    group: GroupId(group),
+                    lease_ids,
+                }
+            } else {
+                AppRequest::AckMany {
+                    topic: TopicId(topic),
+                    group: GroupId(group),
+                    lease_ids,
+                }
+            };
+            let resp = write_and_map(&raft, app).await;
+            for reply in replies {
+                let _ = reply.send(resp.clone());
+            }
+        }
+    }
 }
 
 async fn handle_poll(ctx: &Ctx, p: proto::Poll) -> Response {
-    {
+    let is_leader = {
         let metrics = ctx.raft.metrics();
         let m = metrics.borrow();
-        if m.current_leader != Some(m.id) {
-            return resp_not_leader(String::new());
-        }
+        m.current_leader == Some(m.id)
+    };
+    if !is_leader {
+        return resp_not_leader(leader_addr(&ctx.raft));
     }
 
     let topic = TopicId(p.topic.clone());
     let group = GroupId(p.group.clone());
-    let deadline = Instant::now() + Duration::from_millis(p.wait_ms);
+    let max = if p.max == 0 { DEFAULT_POLL_MAX } else { p.max.min(MAX_POLL_MAX) };
+    let visibility = if p.visibility_timeout_ms == 0 {
+        DEFAULT_VISIBILITY_MS
+    } else {
+        p.visibility_timeout_ms
+    };
+    let wait_ms = p.wait_ms.min(MAX_WAIT_MS);
+    let deadline = Instant::now() + Duration::from_millis(wait_ms);
 
     loop {
         if ctx.sm.has_deliverable(&p.topic, &p.group, now_ms()) {
@@ -233,8 +504,8 @@ async fn handle_poll(ctx: &Ctx, p: proto::Poll) -> Response {
             let app = AppRequest::Poll {
                 topic: topic.clone(),
                 group: group.clone(),
-                max: p.max,
-                visibility_timeout_ms: p.visibility_timeout_ms,
+                max,
+                visibility_timeout_ms: visibility,
                 ts_ms: now_ms(),
             };
             let resp = match ctx.raft.client_write(app).await {
@@ -247,22 +518,21 @@ async fn handle_poll(ctx: &Ctx, p: proto::Poll) -> Response {
             };
             if !items.is_empty() {
                 if p.ack_mode == "auto" {
-                    for d in &items {
-                        let _ = ctx
-                            .raft
-                            .client_write(AppRequest::Ack {
-                                topic: topic.clone(),
-                                group: group.clone(),
-                                lease_id: d.lease_id,
-                            })
-                            .await;
-                    }
+                    let lease_ids = items.iter().map(|d| d.lease_id).collect();
+                    let _ = ctx
+                        .raft
+                        .client_write(AppRequest::AckMany {
+                            topic: topic.clone(),
+                            group: group.clone(),
+                            lease_ids,
+                        })
+                        .await;
                 }
                 return resp_polled(items);
             }
         }
 
-        if p.wait_ms == 0 || Instant::now() >= deadline {
+        if wait_ms == 0 || Instant::now() >= deadline {
             return resp_polled(Vec::new());
         }
         let wait = deadline
@@ -313,19 +583,28 @@ fn stats_response(raft: &HermesRaft, sm: &StateMachineStore) -> Response {
     }
 }
 
+async fn enqueue_ack(ctx: &Ctx, topic: String, group: String, lease_id: u64, nack: bool) -> Response {
+    let (reply, reply_rx) = oneshot::channel();
+    let job = AckJob {
+        topic,
+        group,
+        lease_id,
+        nack,
+        reply: Some(reply),
+    };
+    if ctx.ack_tx.send(job).await.is_err() {
+        return resp_error("internal", "ack batcher unavailable".to_string());
+    }
+    match reply_rx.await {
+        Ok(resp) => resp,
+        Err(_) => resp_error("internal", "ack batcher dropped the request".to_string()),
+    }
+}
+
 async fn handle_request(ctx: &Ctx, req: Request) -> Response {
     let Some(kind) = req.kind else {
         return resp_error("bad_request", "empty request".to_string());
     };
-
-    if let request::Kind::Produce(p) = &kind {
-        if let Some((rate_milli, burst)) = ctx.sm.rate_config(&p.topic) {
-            let rate = rate_milli as f64 / 1000.0;
-            if let Err(retry_after_ms) = ctx.limiter.check(&p.topic, rate, burst.max(1) as f64) {
-                return resp_rate_limited(retry_after_ms);
-            }
-        }
-    }
 
     let raft = &ctx.raft;
     match kind {
@@ -355,28 +634,8 @@ async fn handle_request(ctx: &Ctx, req: Request) -> Response {
             )
             .await
         }
-        request::Kind::Ack(a) => {
-            write_and_map(
-                raft,
-                AppRequest::Ack {
-                    topic: TopicId(a.topic),
-                    group: GroupId(a.group),
-                    lease_id: a.lease_id,
-                },
-            )
-            .await
-        }
-        request::Kind::Nack(a) => {
-            write_and_map(
-                raft,
-                AppRequest::Nack {
-                    topic: TopicId(a.topic),
-                    group: GroupId(a.group),
-                    lease_id: a.lease_id,
-                },
-            )
-            .await
-        }
+        request::Kind::Ack(a) => enqueue_ack(ctx, a.topic, a.group, a.lease_id, false).await,
+        request::Kind::Nack(a) => enqueue_ack(ctx, a.topic, a.group, a.lease_id, true).await,
         request::Kind::Commit(c) => {
             write_and_map(
                 raft,
@@ -392,90 +651,119 @@ async fn handle_request(ctx: &Ctx, req: Request) -> Response {
             write_and_map(raft, AppRequest::CreateTopic { topic: TopicId(c.topic) }).await
         }
         request::Kind::DeleteTopic(c) => {
-            write_and_map(raft, AppRequest::DeleteTopic { topic: TopicId(c.topic) }).await
+            let topic = c.topic.clone();
+            let resp = write_and_map(raft, AppRequest::DeleteTopic { topic: TopicId(c.topic) }).await;
+            if matches!(resp.kind, Some(response::Kind::Ok(_))) {
+                ctx.notifiers.lock().unwrap().remove(&topic);
+                ctx.limiter.forget(&topic);
+            }
+            resp
         }
         request::Kind::Subscribe(_) => {
-            resp_error("bad_request", "subscribe must be the first message on its own connection".to_string())
+            resp_error("bad_request", "subscribe takes over its connection".to_string())
         }
     }
 }
 
-async fn handle_subscribe(ctx: Ctx, stream: TcpStream, sub: proto::Subscribe) -> io::Result<()> {
-    let (mut read_half, mut write_half) = stream.into_split();
-
+async fn handle_subscribe(
+    ctx: Ctx,
+    mut read_half: OwnedReadHalf,
+    mut write_half: OwnedWriteHalf,
+    sub: proto::Subscribe,
+) -> io::Result<()> {
     let is_leader = {
         let metrics = ctx.raft.metrics();
         let m = metrics.borrow();
         m.current_leader == Some(m.id)
     };
     if !is_leader {
-        let resp = resp_not_leader(String::new());
+        let resp = resp_not_leader(leader_addr(&ctx.raft));
         write_frame(&mut write_half, &resp.encode_to_vec()).await?;
         return Ok(());
     }
 
     let topic = TopicId(sub.topic.clone());
     let group = GroupId(sub.group.clone());
-    let prefetch = sub.prefetch.max(1) as usize;
+    let prefetch = sub.prefetch.clamp(1, MAX_POLL_MAX) as usize;
     let auto = sub.ack_mode == "auto";
     let visibility = if sub.visibility_timeout_ms == 0 {
-        30_000
+        DEFAULT_VISIBILITY_MS
     } else {
         sub.visibility_timeout_ms
     };
 
-    let in_flight = Arc::new(AtomicUsize::new(0));
+    let tracking: Arc<StdMutex<SubTracking>> = Arc::new(StdMutex::new(SubTracking::default()));
     let freed = Arc::new(Notify::new());
+    let closed = Arc::new(AtomicBool::new(false));
 
-    let reader = if auto {
-        None
-    } else {
+    let reader = {
         let ctx = ctx.clone();
         let topic = topic.clone();
         let group = group.clone();
-        let in_flight = in_flight.clone();
+        let tracking = tracking.clone();
         let freed = freed.clone();
-        Some(tokio::spawn(async move {
+        let closed = closed.clone();
+        tokio::spawn(async move {
             loop {
                 let bytes = match read_frame(&mut read_half).await {
                     Ok(b) => b,
                     Err(_) => break,
                 };
+                if auto {
+                    continue;
+                }
                 let Ok(req) = Request::decode(bytes.as_slice()) else {
                     continue;
                 };
                 match req.kind {
                     Some(request::Kind::Ack(a)) => {
+                        let acked_until = now_ms().saturating_add(ACK_GRACE_MS);
+                        let resolved = tracking
+                            .lock()
+                            .unwrap()
+                            .resolve(a.lease_id, Some(acked_until));
                         let _ = ctx
-                            .raft
-                            .client_write(AppRequest::Ack {
-                                topic: topic.clone(),
-                                group: group.clone(),
-                                lease_id: a.lease_id,
+                            .ack_tx
+                            .send(AckJob {
+                                topic: topic.0.clone(),
+                                group: group.0.clone(),
+                                lease_id: resolved.unwrap_or(a.lease_id),
+                                nack: false,
+                                reply: None,
                             })
                             .await;
-                        in_flight.fetch_sub(1, Ordering::SeqCst);
-                        freed.notify_one();
+                        if resolved.is_some() {
+                            freed.notify_one();
+                        }
                     }
                     Some(request::Kind::Nack(a)) => {
+                        let resolved = tracking.lock().unwrap().resolve(a.lease_id, None);
                         let _ = ctx
-                            .raft
-                            .client_write(AppRequest::Nack {
-                                topic: topic.clone(),
-                                group: group.clone(),
-                                lease_id: a.lease_id,
+                            .ack_tx
+                            .send(AckJob {
+                                topic: topic.0.clone(),
+                                group: group.0.clone(),
+                                lease_id: resolved.unwrap_or(a.lease_id),
+                                nack: true,
+                                reply: None,
                             })
                             .await;
-                        in_flight.fetch_sub(1, Ordering::SeqCst);
-                        freed.notify_one();
+                        if resolved.is_some() {
+                            freed.notify_one();
+                        }
                     }
                     _ => {}
                 }
             }
-        }))
+            closed.store(true, Ordering::SeqCst);
+            freed.notify_one();
+        })
     };
 
     loop {
+        if closed.load(Ordering::SeqCst) {
+            break;
+        }
         {
             let metrics = ctx.raft.metrics();
             let m = metrics.borrow();
@@ -484,7 +772,7 @@ async fn handle_subscribe(ctx: Ctx, stream: TcpStream, sub: proto::Subscribe) ->
             }
         }
 
-        let cur = in_flight.load(Ordering::SeqCst);
+        let cur = tracking.lock().unwrap().live_count(now_ms(), visibility);
         let mut pushed_any = false;
         if cur < prefetch && ctx.sm.has_deliverable(&sub.topic, &sub.group, now_ms()) {
             let allowed = match ctx.sm.rate_config(&sub.topic) {
@@ -505,28 +793,50 @@ async fn handle_subscribe(ctx: Ctx, stream: TcpStream, sub: proto::Subscribe) ->
                 match ctx.raft.client_write(app).await {
                     Ok(r) => {
                         if let AppResponse::Polled { items } = r.data {
+                            if auto && !items.is_empty() {
+                                let lease_ids = items.iter().map(|d| d.lease_id).collect();
+                                let _ = ctx
+                                    .raft
+                                    .client_write(AppRequest::AckMany {
+                                        topic: topic.clone(),
+                                        group: group.clone(),
+                                        lease_ids,
+                                    })
+                                    .await;
+                            }
                             for d in items {
                                 pushed_any = true;
-                                if auto {
-                                    let _ = ctx
-                                        .raft
-                                        .client_write(AppRequest::Ack {
-                                            topic: topic.clone(),
-                                            group: group.clone(),
-                                            lease_id: d.lease_id,
-                                        })
-                                        .await;
-                                } else {
-                                    in_flight.fetch_add(1, Ordering::SeqCst);
+                                if !auto {
+                                    let now = now_ms();
+                                    let deadline = now.saturating_add(visibility);
+                                    let delivery = tracking
+                                        .lock()
+                                        .unwrap()
+                                        .deliver(d.offset, d.lease_id, deadline, now);
+                                    match delivery {
+                                        Delivery::Refreshed => continue,
+                                        Delivery::AlreadyAcked => {
+                                            let _ = ctx
+                                                .ack_tx
+                                                .send(AckJob {
+                                                    topic: topic.0.clone(),
+                                                    group: group.0.clone(),
+                                                    lease_id: d.lease_id,
+                                                    nack: false,
+                                                    reply: None,
+                                                })
+                                                .await;
+                                            continue;
+                                        }
+                                        Delivery::Push => {}
+                                    }
                                 }
                                 let frame = resp_polled(vec![d]);
                                 if write_frame(&mut write_half, &frame.encode_to_vec())
                                     .await
                                     .is_err()
                                 {
-                                    if let Some(r) = &reader {
-                                        r.abort();
-                                    }
+                                    reader.abort();
                                     return Ok(());
                                 }
                             }
@@ -548,18 +858,24 @@ async fn handle_subscribe(ctx: Ctx, stream: TcpStream, sub: proto::Subscribe) ->
         }
     }
 
-    if let Some(r) = &reader {
-        r.abort();
-    }
+    reader.abort();
     Ok(())
 }
 
 pub async fn serve_clients(raft: HermesRaft, sm: StateMachineStore, listener: TcpListener) {
+    let notifiers: Arc<StdMutex<HashMap<String, Arc<Notify>>>> =
+        Arc::new(StdMutex::new(HashMap::new()));
+    let (produce_tx, produce_rx) = mpsc::channel(PRODUCE_QUEUE_DEPTH);
+    tokio::spawn(produce_batcher(raft.clone(), notifiers.clone(), produce_rx));
+    let (ack_tx, ack_rx) = mpsc::channel(ACK_QUEUE_DEPTH);
+    tokio::spawn(ack_batcher(raft.clone(), ack_rx));
     let ctx = Ctx {
         raft,
         sm,
         limiter: Arc::new(RateLimiter::default()),
-        notifiers: Arc::new(StdMutex::new(HashMap::new())),
+        notifiers,
+        produce_tx,
+        ack_tx,
     };
     loop {
         match listener.accept().await {
@@ -576,21 +892,58 @@ pub async fn serve_clients(raft: HermesRaft, sm: StateMachineStore, listener: Tc
     }
 }
 
-async fn handle_client(ctx: Ctx, mut stream: TcpStream) -> io::Result<()> {
-    loop {
-        let bytes = read_frame(&mut stream).await?;
+async fn handle_client(ctx: Ctx, stream: TcpStream) -> io::Result<()> {
+    let (mut read_half, write_half) = stream.into_split();
+    let (tx, mut rx) = mpsc::channel::<oneshot::Receiver<Response>>(PIPELINE_DEPTH);
+
+    let writer = tokio::spawn(async move {
+        let mut write_half = write_half;
+        while let Some(pending) = rx.recv().await {
+            let Ok(resp) = pending.await else {
+                break;
+            };
+            if write_frame(&mut write_half, &resp.encode_to_vec()).await.is_err() {
+                break;
+            }
+        }
+        write_half
+    });
+
+    let sub = loop {
+        let bytes = match read_frame(&mut read_half).await {
+            Ok(b) => b,
+            Err(_) => break None,
+        };
         let req = match Request::decode(bytes.as_slice()) {
             Ok(req) => req,
             Err(e) => {
-                let resp = resp_error("bad_request", e.to_string());
-                write_frame(&mut stream, &resp.encode_to_vec()).await?;
+                let (otx, orx) = oneshot::channel();
+                let _ = otx.send(resp_error("bad_request", e.to_string()));
+                if tx.send(orx).await.is_err() {
+                    break None;
+                }
                 continue;
             }
         };
         if let Some(request::Kind::Subscribe(sub)) = req.kind {
-            return handle_subscribe(ctx, stream, sub).await;
+            break Some(sub);
         }
-        let response = handle_request(&ctx, req).await;
-        write_frame(&mut stream, &response.encode_to_vec()).await?;
+        let (otx, orx) = oneshot::channel();
+        let ctx = ctx.clone();
+        tokio::spawn(async move {
+            let _ = otx.send(handle_request(&ctx, req).await);
+        });
+        if tx.send(orx).await.is_err() {
+            break None;
+        }
+    };
+
+    drop(tx);
+    let Ok(write_half) = writer.await else {
+        return Ok(());
+    };
+    match sub {
+        Some(sub) => handle_subscribe(ctx, read_half, write_half, sub).await,
+        None => Ok(()),
     }
 }

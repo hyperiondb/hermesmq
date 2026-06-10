@@ -6,6 +6,7 @@ through the Raft log so the queue survives node failure. Clients talk over a min
 length-prefixed **TCP + Protobuf** protocol. A napi-rs binding exposes it to Node.
 
 ## Decisions (locked)
+
 - **Language / shape:** Rust core in `hermesmq` (lib + `hermesmqd` binary); napi-rs binding in `hermesmq-node`.
 - **Consensus:** openraft (async, tokio-native; membership changes + snapshots built in).
 - **Client protocol:** length-prefixed TCP frames carrying **Protobuf** messages (one `Request`/`Response` envelope; message payload is an opaque `bytes` field).
@@ -16,6 +17,7 @@ length-prefixed **TCP + Protobuf** protocol. A napi-rs binding exposes it to Nod
 ---
 
 ## Architecture (what goes through Raft)
+
 | Concern | Replicated via Raft? | Notes |
 |---|---|---|
 | Produce (append message to topic) | **Yes** | leader appends, replicates, then acks producer |
@@ -30,6 +32,12 @@ length-prefixed **TCP + Protobuf** protocol. A napi-rs binding exposes it to Nod
 State machine = the queue: topics → ordered message log, per-group consumer offsets, in-flight
 (leased) set with visibility timeout, and a dedup window for idempotent produce.
 
+## TODO
+
+---
+
+- [] metrics disable/ enable via env
+
 ---
 
 ## Unplanned for open source
@@ -40,25 +48,9 @@ State machine = the queue: topics → ordered message log, per-group consumer of
 
 ---
 
-- [] Optimization: peer client connects per RPC; add connection pooling/keepalive.
-- [] Backpressure: per-conn requests are sequential (in-flight = 1); bounded frame size done. `RateLimited` field is in the proto, enforcement = Phase 7.
-- [] subscribe side dedup
-- [] perf tests (throughput on publish/ subscribe)
-
----
-
 ## Security / correctness caveats
 
 - **TCP + Protobuf has no auth/TLS by itself** — only safe on a trusted private network to start. Add auth (token) + optional TLS before any untrusted exposure. Treat the peer-RPC port as cluster-internal only; firewall it.
 - **Determinism in the state machine is mandatory** — no wall-clock, no RNG, no map-iteration-order dependence during `apply()`; otherwise replicas diverge. Carry timestamps/randomness in the log entry.
 - **Writes only via the leader** — reads from a follower can be stale; document read semantics (leader-only for read-your-writes).
 - At-least-once means consumers must be **idempotent** at the app layer; we provide produce-side dedup, not exactly-once end-to-end.
-
-## Open questions (confirm before building)
-- [x] Storage: redb chosen for log/metadata/offsets with payload segment-log for high throughput
-- [x] Priority: 8 levels; policy: reserved fraction
-- [x] Rate limiting: cluster-wide
-- [x] Topics: single ordered log per topic
-- [x] Payloads go **through the Raft log**
-- [x] consume models: pull (`poll`, long-poll) **and** server push (`subscribe`, leader-driven, lease-based — preserves priority + redelivery; `prefetch`-bounded concurrent processing)
-- [x] Cluster size target:  3, no learners/observers are needed.

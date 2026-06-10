@@ -9,19 +9,19 @@ use tokio::net::TcpListener;
 #[derive(Parser, Debug)]
 #[command(name = "hermesmqd", version, about = "Raft-replicated message queue")]
 struct Cli {
-    #[arg(long, default_value_t = 1)]
+    #[arg(long, env = "HERMESMQ_NODE_ID", default_value_t = 1)]
     node_id: u64,
 
-    #[arg(long, default_value = "data")]
+    #[arg(long, env = "HERMESMQ_DATA_DIR", default_value = "data")]
     data_dir: PathBuf,
 
-    #[arg(long, default_value = "127.0.0.1:7600")]
+    #[arg(long, env = "HERMESMQ_CLIENT_ADDR", default_value = "127.0.0.1:7600")]
     client_addr: SocketAddr,
 
-    #[arg(long, default_value = "127.0.0.1:7700")]
+    #[arg(long, env = "HERMESMQ_PEER_ADDR", default_value = "127.0.0.1:7700")]
     peer_addr: SocketAddr,
 
-    #[arg(long, default_value = "127.0.0.1:9600")]
+    #[arg(long, env = "HERMESMQ_METRICS_ADDR", default_value = "127.0.0.1:9600")]
     metrics_addr: SocketAddr,
 }
 

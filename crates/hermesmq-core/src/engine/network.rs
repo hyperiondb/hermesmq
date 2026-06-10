@@ -84,6 +84,7 @@ impl RaftNetworkFactory<TypeConfig> for PeerNetwork {
             target,
             addr: node.addr.clone(),
             blocked: self.blocked.clone(),
+            stream: None,
         }
     }
 }
@@ -92,24 +93,31 @@ pub struct PeerConnection {
     target: NodeId,
     addr: String,
     blocked: PartitionControl,
+    stream: Option<TcpStream>,
 }
 
 impl PeerConnection {
-    async fn call(&self, req: PeerRequest) -> Result<PeerResponse, Unreachable> {
+    async fn call(&mut self, req: PeerRequest) -> Result<PeerResponse, Unreachable> {
         if self.blocked.lock().unwrap().contains(&self.target) {
+            self.stream = None;
             return Err(Unreachable::new(&to_io("peer is partitioned")));
         }
-        let mut stream = TcpStream::connect(&self.addr)
-            .await
-            .map_err(|e| Unreachable::new(&e))?;
         let bytes = postcard::to_stdvec(&req).map_err(|e| Unreachable::new(&to_io(e)))?;
+        let mut stream = match self.stream.take() {
+            Some(stream) => stream,
+            None => TcpStream::connect(&self.addr)
+                .await
+                .map_err(|e| Unreachable::new(&e))?,
+        };
         write_frame(&mut stream, &bytes)
             .await
             .map_err(|e| Unreachable::new(&e))?;
         let resp_bytes = read_frame(&mut stream)
             .await
             .map_err(|e| Unreachable::new(&e))?;
-        postcard::from_bytes(&resp_bytes).map_err(|e| Unreachable::new(&to_io(e)))
+        let resp = postcard::from_bytes(&resp_bytes).map_err(|e| Unreachable::new(&to_io(e)))?;
+        self.stream = Some(stream);
+        Ok(resp)
     }
 }
 
