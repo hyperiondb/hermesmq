@@ -2,7 +2,7 @@
 
 The simple af, performant, durable Kafka-like **Raft-replicated message queue**.
 
-Status: **in progress**
+Status: **in production**
 
 ## Features
 
