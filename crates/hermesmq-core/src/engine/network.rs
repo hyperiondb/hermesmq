@@ -35,6 +35,7 @@ pub async fn serve_peer(raft: HermesRaft, listener: TcpListener) {
     loop {
         match listener.accept().await {
             Ok((stream, _)) => {
+                let _ = stream.set_nodelay(true);
                 let raft = raft.clone();
                 tokio::spawn(async move {
                     if let Err(e) = handle_conn(raft, stream).await {
@@ -105,9 +106,13 @@ impl PeerConnection {
         let bytes = postcard::to_stdvec(&req).map_err(|e| Unreachable::new(&to_io(e)))?;
         let mut stream = match self.stream.take() {
             Some(stream) => stream,
-            None => TcpStream::connect(&self.addr)
-                .await
-                .map_err(|e| Unreachable::new(&e))?,
+            None => {
+                let stream = TcpStream::connect(&self.addr)
+                    .await
+                    .map_err(|e| Unreachable::new(&e))?;
+                stream.set_nodelay(true).map_err(|e| Unreachable::new(&e))?;
+                stream
+            }
         };
         write_frame(&mut stream, &bytes)
             .await

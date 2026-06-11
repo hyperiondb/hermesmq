@@ -45,9 +45,9 @@ pub async fn build_raft_partitionable<S: Storage>(
 ) -> Result<(HermesRaft, StateMachineStore<S>, PartitionControl), Box<dyn std::error::Error + Send + Sync>>
 {
     let config = Arc::new(Config {
-        heartbeat_interval: 100,
-        election_timeout_min: 500,
-        election_timeout_max: 1500,
+        heartbeat_interval: 300,
+        election_timeout_min: 1000,
+        election_timeout_max: 2000,
         max_payload_entries: 32,
         ..Config::default()
     });

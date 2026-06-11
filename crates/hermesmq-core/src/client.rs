@@ -880,6 +880,7 @@ pub async fn serve_clients(raft: HermesRaft, sm: StateMachineStore, listener: Tc
     loop {
         match listener.accept().await {
             Ok((stream, _)) => {
+                let _ = stream.set_nodelay(true);
                 let ctx = ctx.clone();
                 tokio::spawn(async move {
                     if let Err(e) = handle_client(ctx, stream).await {

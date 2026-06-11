@@ -1,6 +1,6 @@
 # HermesMQ
-
-A **Raft-replicated message queue**.
+1
+The simple af, performant, durable Kafka-like **Raft-replicated message queue**.
 
 Status: **in progress**
 

@@ -36,7 +36,7 @@ State machine = the queue: topics → ordered message log, per-group consumer of
 
 ---
 
-- [] metrics disable/ enable via env
+- [ ] ...
 
 ---
 
@@ -45,6 +45,10 @@ State machine = the queue: topics → ordered message log, per-group consumer of
 - [ ] segmented append-only payload store
 - [ ] mTLS, auth
 - [ ] Granular metrics
+- [ ] REST API
+- [ ] DLQ
+- [ ] UI
+- [ ] Partitioning 
 
 ---
 

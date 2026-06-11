@@ -6,6 +6,7 @@ services:
       - HERMESMQ_METRICS_ENABLED=true
     ports:
       - "7600:7600"
+      - "7700:7700"
       - "9600:9600"
     volumes:
       - hermesmq1-data:/data
@@ -22,6 +23,7 @@ services:
       - HERMESMQ_METRICS_ENABLED=true
     ports:
       - "7601:7600"
+      - "7700:7700"
       - "9601:9600"
     volumes:
       - hermesmq2-data:/data
@@ -38,6 +40,7 @@ services:
       - HERMESMQ_METRICS_ENABLED=true
     ports:
       - "7602:7600"
+      - "7700:7700"
       - "9602:9600"
     volumes:
       - hermesmq3-data:/data
