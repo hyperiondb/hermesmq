@@ -1,5 +1,5 @@
 # HermesMQ
-1
+
 The simple af, performant, durable Kafka-like **Raft-replicated message queue**.
 
 Status: **in progress**
@@ -25,7 +25,7 @@ Status: **in progress**
 
 ...testing on local machine, w/o network, etc. bottlenecks
 
-![HermesMQ performance](performance.png)
+![HermesMQ performance](https://github.com/hyperiondb/hermesmq/blob/main/performance.png?raw=true)
 
 The chart is regenerated from the measured numbers on every `cargo perf` run.
 
