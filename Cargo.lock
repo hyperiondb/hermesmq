@@ -610,14 +610,14 @@ checksum = "2304e00983f87ffb38b55b444b5e3b60a884b5d30c0fca7d82fe33449bbe55ea"
 
 [[package]]
 name = "hermesmq"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "hermesmq-core",
 ]
 
 [[package]]
 name = "hermesmq-core"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "hermesmq-proto",
  "openraft",
@@ -634,7 +634,7 @@ dependencies = [
 
 [[package]]
 name = "hermesmq-proto"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "prost",
  "prost-build",
@@ -643,7 +643,7 @@ dependencies = [
 
 [[package]]
 name = "hermesmqd"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "anyhow",
  "clap",
