@@ -139,7 +139,13 @@ struct RateLimiter {
 }
 
 impl RateLimiter {
-    fn check(&self, topic: &str, rate_per_sec: f64, burst: f64) -> std::result::Result<(), u64> {
+    fn take(
+        &self,
+        topic: &str,
+        rate_per_sec: f64,
+        burst: f64,
+        want: u32,
+    ) -> std::result::Result<u32, u64> {
         let mut buckets = self.buckets.lock().unwrap();
         let now = Instant::now();
         let bucket = buckets.entry(topic.to_string()).or_insert(Bucket {
@@ -149,17 +155,27 @@ impl RateLimiter {
         let elapsed = now.duration_since(bucket.last).as_secs_f64();
         bucket.last = now;
         bucket.tokens = (bucket.tokens + elapsed * rate_per_sec).min(burst);
-        if bucket.tokens >= 1.0 {
-            bucket.tokens -= 1.0;
-            Ok(())
-        } else {
+        let grant = (bucket.tokens.floor() as u32).min(want);
+        if grant == 0 {
             let needed = 1.0 - bucket.tokens;
             let retry_ms = if rate_per_sec > 0.0 {
                 (needed / rate_per_sec * 1000.0).ceil() as u64
             } else {
                 1000
             };
-            Err(retry_ms)
+            return Err(retry_ms);
+        }
+        bucket.tokens -= grant as f64;
+        Ok(grant)
+    }
+
+    fn refund(&self, topic: &str, amount: u32, burst: f64) {
+        if amount == 0 {
+            return;
+        }
+        let mut buckets = self.buckets.lock().unwrap();
+        if let Some(bucket) = buckets.get_mut(topic) {
+            bucket.tokens = (bucket.tokens + amount as f64).min(burst);
         }
     }
 
@@ -343,12 +359,6 @@ async fn handle_produce(ctx: &Ctx, p: proto::Produce) -> Response {
             format!("payload is {} bytes; max is {MAX_PAYLOAD_BYTES}", p.payload.len()),
         );
     }
-    if let Some((rate_milli, burst)) = ctx.sm.rate_config(&p.topic) {
-        let rate = rate_milli as f64 / 1000.0;
-        if let Err(retry_after_ms) = ctx.limiter.check(&p.topic, rate, burst.max(1) as f64) {
-            return resp_rate_limited(retry_after_ms);
-        }
-    }
     let (reply, reply_rx) = oneshot::channel();
     if ctx.produce_tx.send(ProduceJob { p, reply }).await.is_err() {
         return resp_error("internal", "produce batcher unavailable".to_string());
@@ -495,16 +505,21 @@ async fn handle_poll(ctx: &Ctx, p: proto::Poll) -> Response {
 
     loop {
         if ctx.sm.has_deliverable(&p.topic, &p.group, now_ms()) {
-            if let Some((rate_milli, burst)) = ctx.sm.rate_config(&p.topic) {
-                let rate = rate_milli as f64 / 1000.0;
-                if let Err(retry) = ctx.limiter.check(&p.topic, rate, burst.max(1) as f64) {
-                    return resp_rate_limited(retry);
+            let rate_cfg = ctx.sm.rate_config(&p.topic);
+            let grant = match rate_cfg {
+                Some((rate_milli, burst)) => {
+                    let rate = rate_milli as f64 / 1000.0;
+                    match ctx.limiter.take(&p.topic, rate, burst.max(1) as f64, max) {
+                        Ok(g) => g,
+                        Err(retry) => return resp_rate_limited(retry),
+                    }
                 }
-            }
+                None => max,
+            };
             let app = AppRequest::Poll {
                 topic: topic.clone(),
                 group: group.clone(),
-                max,
+                max: grant,
                 visibility_timeout_ms: visibility,
                 ts_ms: now_ms(),
             };
@@ -516,6 +531,13 @@ async fn handle_poll(ctx: &Ctx, p: proto::Poll) -> Response {
                 AppResponse::Polled { items } => items,
                 other => return app_response_to_proto(other),
             };
+            if let Some((_, burst)) = rate_cfg {
+                ctx.limiter.refund(
+                    &p.topic,
+                    grant.saturating_sub(items.len() as u32),
+                    burst.max(1) as f64,
+                );
+            }
             if !items.is_empty() {
                 if p.ack_mode == "auto" {
                     let lease_ids = items.iter().map(|d| d.lease_id).collect();
@@ -775,24 +797,33 @@ async fn handle_subscribe(
         let cur = tracking.lock().unwrap().live_count(now_ms(), visibility);
         let mut pushed_any = false;
         if cur < prefetch && ctx.sm.has_deliverable(&sub.topic, &sub.group, now_ms()) {
-            let allowed = match ctx.sm.rate_config(&sub.topic) {
+            let want = (prefetch - cur) as u32;
+            let rate_cfg = ctx.sm.rate_config(&sub.topic);
+            let grant = match rate_cfg {
                 Some((rate_milli, burst)) => ctx
                     .limiter
-                    .check(&sub.topic, rate_milli as f64 / 1000.0, burst.max(1) as f64)
-                    .is_ok(),
-                None => true,
+                    .take(&sub.topic, rate_milli as f64 / 1000.0, burst.max(1) as f64, want)
+                    .ok(),
+                None => Some(want),
             };
-            if allowed {
+            if let Some(grant) = grant {
                 let app = AppRequest::Poll {
                     topic: topic.clone(),
                     group: group.clone(),
-                    max: (prefetch - cur) as u32,
+                    max: grant,
                     visibility_timeout_ms: visibility,
                     ts_ms: now_ms(),
                 };
                 match ctx.raft.client_write(app).await {
                     Ok(r) => {
                         if let AppResponse::Polled { items } = r.data {
+                            if let Some((_, burst)) = rate_cfg {
+                                ctx.limiter.refund(
+                                    &sub.topic,
+                                    grant.saturating_sub(items.len() as u32),
+                                    burst.max(1) as f64,
+                                );
+                            }
                             if auto && !items.is_empty() {
                                 let lease_ids = items.iter().map(|d| d.lease_id).collect();
                                 let _ = ctx

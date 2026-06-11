@@ -14,7 +14,7 @@ Status: **in progress**
 - [x] At-least-once (default) or at-most-once via per-subscription `ack_mode`; `ack`/`nack` + redelivery
 - [x] Consumer-side dedup on `subscribe` — slow handlers get lease auto-refresh instead of same-connection duplicates; late acks still count
 - [x] 8-level priority with reserved-fraction anti-starvation
-- [x] Cluster-wide rate limits (token bucket per topic; `rate` may be < 1/s)
+- [x] Cluster-wide rate limits (token bucket per topic; `rate` may be < 1/s) — paces **delivery** only; produce is never throttled, the backlog absorbs bursts
 - [x] Retention by message count and/or age
 - [x] Idempotent produce (dedup by `producer_id` + `seq`)
 - [x] Configuration via the client (topics, rate limits, retention)
@@ -115,7 +115,9 @@ below is just a name you picked). Same split as Kafka: produce → topic; consum
 ### Methods
 
 **`createTopic(options)`** — create a topic (idempotent) and configure it. `rateLimit` and
-`retention` are **per-topic** and optional; set them here once, not on every publish.
+`retention` are **per-topic** and optional; set them here once, not on every publish. The rate
+limit applies to delivery (poll/subscribe), never to produce: bursts queue up and drain to
+consumers at `ratePerSec`.
 ```js
 await client.createTopic({
   topic: "orders",

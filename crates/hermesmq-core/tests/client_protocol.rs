@@ -550,14 +550,23 @@ async fn client_protocol_rate_limit() {
         Some(response::Kind::Ok(_))
     ));
 
-    // burst = 1: first produce consumes the only token
-    assert!(matches!(
-        call(&mut s, produce("rl", b"a")).await.kind,
-        Some(response::Kind::Produced(_))
-    ));
+    for payload in [b"a", b"b", b"c"] {
+        assert!(
+            matches!(
+                call(&mut s, produce("rl", payload)).await.kind,
+                Some(response::Kind::Produced(_))
+            ),
+            "produce must never be rate limited"
+        );
+    }
 
-    // immediate second produce is over the limit
-    match call(&mut s, produce("rl", b"b")).await.kind {
+    assert_eq!(
+        polled_len(call(&mut s, poll("rl", "g")).await),
+        1,
+        "delivery must be paced to the available tokens (burst = 1)"
+    );
+
+    match call(&mut s, poll("rl", "g")).await.kind {
         Some(response::Kind::Error(e)) => assert_eq!(e.code, "rate_limited"),
         other => panic!("expected rate_limited error, got {other:?}"),
     }
