@@ -112,7 +112,7 @@ fn produce(topic: &str, payload: &[u8]) -> Request {
             topic: topic.to_string(),
             priority: 0,
             content_type: 0,
-            payload: payload.to_vec(),
+            payload: bytes::Bytes::copy_from_slice(payload),
             producer_id: String::new(),
             seq: 0,
         })),
@@ -189,7 +189,7 @@ async fn client_protocol_bootstrap_produce_poll_ack() {
         other => panic!("expected Polled, got {other:?}"),
     };
     assert_eq!(items.len(), 1);
-    assert_eq!(items[0].payload, b"hello");
+    assert_eq!(items[0].payload, &b"hello"[..]);
 
     let ack = Request {
         kind: Some(request::Kind::Ack(proto::Ack {
@@ -232,7 +232,7 @@ async fn client_protocol_long_poll_wakes_on_produce() {
     match resp.kind {
         Some(response::Kind::Polled(p)) => {
             assert_eq!(p.items.len(), 1, "long-poll must wake and deliver on produce");
-            assert_eq!(p.items[0].payload, b"wakeup");
+            assert_eq!(p.items[0].payload, &b"wakeup"[..]);
         }
         other => panic!("expected Polled, got {other:?}"),
     }
@@ -260,7 +260,7 @@ async fn client_protocol_push_subscribe_manual() {
             Some(response::Kind::Polled(p)) => p.items.into_iter().next().unwrap(),
             other => panic!("expected pushed Polled, got {other:?}"),
         };
-        got.push(item.payload.clone());
+        got.push(item.payload.to_vec());
         write_req(
             &mut sub,
             Request {
@@ -296,7 +296,7 @@ async fn client_protocol_push_subscribe_auto_wakes_on_produce() {
     match read_resp(&mut sub).await.kind {
         Some(response::Kind::Polled(p)) => {
             assert_eq!(p.items.len(), 1);
-            assert_eq!(p.items[0].payload, b"later");
+            assert_eq!(p.items[0].payload, &b"later"[..]);
         }
         other => panic!("expected pushed Polled, got {other:?}"),
     }
@@ -326,7 +326,7 @@ async fn client_protocol_subscribe_duplicate_ack_does_not_stall() {
         .expect("subscription must keep delivering after a duplicate ack");
     match m2.kind {
         Some(response::Kind::Polled(p)) => {
-            assert_eq!(p.items[0].payload, b"second");
+            assert_eq!(p.items[0].payload, &b"second"[..]);
         }
         other => panic!("expected pushed Polled, got {other:?}"),
     }
@@ -357,7 +357,7 @@ async fn client_protocol_subscribe_reclaims_slot_after_visibility_expiry() {
     match second.kind {
         Some(response::Kind::Polled(p)) => {
             let m2 = &p.items[0];
-            assert_eq!(m2.payload, b"stuck");
+            assert_eq!(m2.payload, &b"stuck"[..]);
             assert_ne!(m2.lease_id, m1.lease_id, "redelivery must carry a fresh lease");
         }
         other => panic!("expected pushed Polled, got {other:?}"),
@@ -382,7 +382,7 @@ async fn client_protocol_subscribe_dedups_slow_handler_and_accepts_late_ack() {
         Some(response::Kind::Polled(p)) => p.items.into_iter().next().unwrap(),
         other => panic!("expected pushed Polled, got {other:?}"),
     };
-    assert_eq!(m1.payload, b"slow");
+    assert_eq!(m1.payload, &b"slow"[..]);
 
     let dup = tokio::time::timeout(Duration::from_millis(800), read_resp(&mut sub)).await;
     assert!(
@@ -399,7 +399,7 @@ async fn client_protocol_subscribe_dedups_slow_handler_and_accepts_late_ack() {
     match second.kind {
         Some(response::Kind::Polled(p)) => {
             assert_eq!(
-                p.items[0].payload, b"next",
+                p.items[0].payload, &b"next"[..],
                 "a late ack must complete the first message via lease translation"
             );
         }

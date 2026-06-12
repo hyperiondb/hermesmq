@@ -63,7 +63,7 @@ fn produce_req(body: &str) -> AppRequest {
         topic: TopicId::from("t"),
         priority: Priority::default(),
         content_type: ContentType::Raw,
-        payload: body.as_bytes().to_vec(),
+        payload: bytes::Bytes::copy_from_slice(body.as_bytes()),
         producer_id: String::new(),
         seq: 0,
         ts_ms: 0,
@@ -115,7 +115,7 @@ async fn three_node_cluster_replicates_and_survives_leader_loss() {
             topic: TopicId::from("t"),
             priority: Priority::default(),
             content_type: ContentType::Raw,
-            payload: b"hello".to_vec(),
+            payload: bytes::Bytes::from_static(b"hello"),
             producer_id: "p1".to_string(),
             seq: 1,
             ts_ms: 0,
@@ -144,7 +144,7 @@ async fn three_node_cluster_replicates_and_survives_leader_loss() {
     match polled.data {
         AppResponse::Polled { items } => {
             assert_eq!(items.len(), 1, "produced message must survive leader loss");
-            assert_eq!(items[0].payload, b"hello");
+            assert_eq!(items[0].payload, &b"hello"[..]);
         }
         other => panic!("expected Polled, got {other:?}"),
     }
@@ -169,7 +169,7 @@ async fn learner_joins_and_catches_up() {
             topic: TopicId::from("t"),
             priority: Priority::default(),
             content_type: ContentType::Raw,
-            payload: b"hello".to_vec(),
+            payload: bytes::Bytes::from_static(b"hello"),
             producer_id: "p1".to_string(),
             seq: 1,
             ts_ms: 0,

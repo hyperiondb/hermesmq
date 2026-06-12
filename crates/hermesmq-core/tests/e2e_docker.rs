@@ -142,7 +142,7 @@ fn produce_req(topic: &str, payload: &[u8], priority: u32, producer_id: &str, se
             topic: topic.to_string(),
             priority,
             content_type: 0,
-            payload: payload.to_vec(),
+            payload: bytes::Bytes::copy_from_slice(payload),
             producer_id: producer_id.to_string(),
             seq,
         })),
@@ -266,8 +266,8 @@ fn e2e_docker_three_node_cluster() {
     step("poll: priority order + dedup, then ack");
     let items = polled_items(request_leader(&poll_req("orders", "workers", 10, 5_000)));
     assert_eq!(items.len(), 2, "dedup re-send must not create a third message");
-    assert_eq!(items[0].payload, b"high", "higher priority must be delivered first");
-    assert_eq!(items[1].payload, b"low");
+    assert_eq!(items[0].payload, &b"high"[..], "higher priority must be delivered first");
+    assert_eq!(items[1].payload, &b"low"[..]);
     for item in &items {
         assert_ok(request_leader(&ack_req("orders", "workers", item.lease_id)));
     }
@@ -283,7 +283,7 @@ fn e2e_docker_three_node_cluster() {
 
     let items = polled_items(request_leader(&poll_req("orders", "workers", 10, 10_000)));
     assert_eq!(items.len(), 1, "the un-acked message must survive leader loss");
-    assert_eq!(items[0].payload, b"survivor");
+    assert_eq!(items[0].payload, &b"survivor"[..]);
     assert_eq!(items[0].offset, survivor_off);
     assert_ok(request_leader(&ack_req("orders", "workers", items[0].lease_id)));
     step("un-acked message survived the leader loss; writes still flowing with 2/3 nodes");

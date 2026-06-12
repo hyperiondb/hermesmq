@@ -19,14 +19,15 @@ const LABEL_COLOR: Rgb = (201, 209, 217);
 const GRID_COLOR: Rgb = (38, 44, 52);
 const TRACK_COLOR: Rgb = (24, 29, 36);
 
-const SECTION_COLORS: [Rgb; 3] = [(88, 166, 255), (63, 185, 80), (188, 140, 255)];
-const SECTION_TITLES: [&str; 3] = [
+const SECTION_COLORS: [Rgb; 4] = [(88, 166, 255), (63, 185, 80), (188, 140, 255), (255, 123, 114)];
+const SECTION_TITLES: [&str; 4] = [
     "End-to-end TCP, single node, fsync on every commit",
     "3-node replicated cluster, in-memory store",
     "Queue state machine, in-process, no I/O",
+    "Tail latency, produce to push delivery, single fsync node (lower is better)",
 ];
 
-const SPECS: [(&str, &str, &str, usize); 10] = [
+const SPECS: [(&str, &str, &str, usize); 13] = [
     ("tcp_seq", "produce, sequential", "msg/s", 0),
     ("tcp_conc", "produce, 4 connections", "msg/s", 0),
     ("tcp_pipe", "produce, pipelined x32", "msg/s", 0),
@@ -37,6 +38,9 @@ const SPECS: [(&str, &str, &str, usize); 10] = [
     ("q_produce", "produce", "ops/s", 2),
     ("q_drain", "poll + ack drain, batch 256", "msg/s", 2),
     ("q_hd", "has_deliverable, 20k backlog", "calls/s", 2),
+    ("lat_p50", "p50", "µs", 3),
+    ("lat_p99", "p99", "µs", 3),
+    ("lat_p999", "p99.9", "µs", 3),
 ];
 
 type Rgb = (u8, u8, u8);
@@ -123,7 +127,7 @@ pub fn render() {
     canvas.text(
         LABEL_X,
         58,
-        "messages per second, log scale - release build - regenerate with: cargo perf",
+        "msg/s and latency in µs, log scale - release build - regenerate with: cargo perf",
         2,
         SUBTITLE_COLOR,
     );
@@ -359,6 +363,7 @@ fn glyph(c: char) -> [u8; 7] {
         ':' => [0x00, 0x0C, 0x0C, 0x00, 0x0C, 0x0C, 0x00],
         '+' => [0x00, 0x04, 0x04, 0x1F, 0x04, 0x04, 0x00],
         '%' => [0x19, 0x19, 0x02, 0x04, 0x08, 0x13, 0x13],
+        'µ' | 'μ' => [0x00, 0x00, 0x11, 0x11, 0x13, 0x1D, 0x10],
         '_' => [0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x1F],
         _ => [0; 7],
     }

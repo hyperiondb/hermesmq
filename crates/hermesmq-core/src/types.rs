@@ -1,3 +1,4 @@
+use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 
 pub type NodeId = u64;
@@ -53,6 +54,6 @@ pub struct Message {
     pub offset: Offset,
     pub priority: Priority,
     pub content_type: ContentType,
-    pub payload: Vec<u8>,
+    pub payload: Bytes,
     pub ts_ms: u64,
 }

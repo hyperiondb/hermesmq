@@ -441,7 +441,11 @@ async fn produce_batcher(
 
 type AckGroup = (Vec<LeaseId>, Vec<oneshot::Sender<Response>>);
 
-async fn ack_batcher(raft: HermesRaft, mut rx: mpsc::Receiver<AckJob>) {
+async fn ack_batcher(
+    raft: HermesRaft,
+    notifiers: Arc<StdMutex<HashMap<String, Arc<Notify>>>>,
+    mut rx: mpsc::Receiver<AckJob>,
+) {
     while let Some(first) = rx.recv().await {
         let mut jobs = vec![first];
         while jobs.len() < ACK_BATCH_MAX {
@@ -463,20 +467,26 @@ async fn ack_batcher(raft: HermesRaft, mut rx: mpsc::Receiver<AckJob>) {
         for ((topic, group, nack), (lease_ids, replies)) in groups {
             let app = if nack {
                 AppRequest::NackMany {
-                    topic: TopicId(topic),
+                    topic: TopicId(topic.clone()),
                     group: GroupId(group),
                     lease_ids,
                 }
             } else {
                 AppRequest::AckMany {
-                    topic: TopicId(topic),
+                    topic: TopicId(topic.clone()),
                     group: GroupId(group),
                     lease_ids,
                 }
             };
             let resp = write_and_map(&raft, app).await;
+            let ok = matches!(resp.kind, Some(response::Kind::Ok(_)));
             for reply in replies {
                 let _ = reply.send(resp.clone());
+            }
+            if nack && ok {
+                if let Some(notifier) = notifiers.lock().unwrap().get(&topic) {
+                    notifier.notify_waiters();
+                }
             }
         }
     }
@@ -504,6 +514,11 @@ async fn handle_poll(ctx: &Ctx, p: proto::Poll) -> Response {
     let deadline = Instant::now() + Duration::from_millis(wait_ms);
 
     loop {
+        let notifier = ctx.notifier(&p.topic);
+        let notified = notifier.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+
         if ctx.sm.has_deliverable(&p.topic, &p.group, now_ms()) {
             let rate_cfg = ctx.sm.rate_config(&p.topic);
             let grant = match rate_cfg {
@@ -560,9 +575,8 @@ async fn handle_poll(ctx: &Ctx, p: proto::Poll) -> Response {
         let wait = deadline
             .saturating_duration_since(Instant::now())
             .min(Duration::from_millis(200));
-        let notifier = ctx.notifier(&p.topic);
         tokio::select! {
-            _ = notifier.notified() => {}
+            _ = notified => {}
             _ = tokio::time::sleep(wait) => {}
         }
     }
@@ -734,7 +748,7 @@ async fn handle_subscribe(
                 if auto {
                     continue;
                 }
-                let Ok(req) = Request::decode(bytes.as_slice()) else {
+                let Ok(req) = Request::decode(bytes) else {
                     continue;
                 };
                 match req.kind {
@@ -793,6 +807,11 @@ async fn handle_subscribe(
                 break;
             }
         }
+
+        let notifier = ctx.notifier(&sub.topic);
+        let notified = notifier.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
 
         let cur = tracking.lock().unwrap().live_count(now_ms(), visibility);
         let mut pushed_any = false;
@@ -881,10 +900,9 @@ async fn handle_subscribe(
         if pushed_any {
             continue;
         }
-        let notifier = ctx.notifier(&sub.topic);
         tokio::select! {
             _ = freed.notified() => {}
-            _ = notifier.notified() => {}
+            _ = notified => {}
             _ = tokio::time::sleep(Duration::from_millis(200)) => {}
         }
     }
@@ -899,7 +917,7 @@ pub async fn serve_clients(raft: HermesRaft, sm: StateMachineStore, listener: Tc
     let (produce_tx, produce_rx) = mpsc::channel(PRODUCE_QUEUE_DEPTH);
     tokio::spawn(produce_batcher(raft.clone(), notifiers.clone(), produce_rx));
     let (ack_tx, ack_rx) = mpsc::channel(ACK_QUEUE_DEPTH);
-    tokio::spawn(ack_batcher(raft.clone(), ack_rx));
+    tokio::spawn(ack_batcher(raft.clone(), notifiers.clone(), ack_rx));
     let ctx = Ctx {
         raft,
         sm,
@@ -946,7 +964,7 @@ async fn handle_client(ctx: Ctx, stream: TcpStream) -> io::Result<()> {
             Ok(b) => b,
             Err(_) => break None,
         };
-        let req = match Request::decode(bytes.as_slice()) {
+        let req = match Request::decode(bytes) {
             Ok(req) => req,
             Err(e) => {
                 let (otx, orx) = oneshot::channel();

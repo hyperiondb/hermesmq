@@ -1,5 +1,6 @@
 use std::path::Path;
 
+use bytes::Bytes;
 use redb::{Database, Durability, ReadableTable, TableDefinition};
 
 use crate::error::{Error, Result};
@@ -15,7 +16,7 @@ fn st<E: std::fmt::Display>(e: E) -> Error {
 }
 
 pub trait Storage: Send + Sync + 'static {
-    fn append_log(&self, entries: &[(u64, Vec<u8>)]) -> Result<()>;
+    fn append_log(&self, entries: &[(u64, Bytes)]) -> Result<()>;
     fn read_log(&self, start: u64, end: u64) -> Result<Vec<(u64, Vec<u8>)>>;
     fn truncate_log_from(&self, index: u64) -> Result<()>;
     fn purge_log_upto(&self, index: u64) -> Result<()>;
@@ -96,12 +97,12 @@ impl RedbStore {
 }
 
 impl Storage for RedbStore {
-    fn append_log(&self, entries: &[(u64, Vec<u8>)]) -> Result<()> {
+    fn append_log(&self, entries: &[(u64, Bytes)]) -> Result<()> {
         let wtx = self.begin_write()?;
         {
             let mut table = wtx.open_table(LOG).map_err(st)?;
             for (index, bytes) in entries {
-                table.insert(*index, bytes.as_slice()).map_err(st)?;
+                table.insert(*index, bytes.as_ref()).map_err(st)?;
             }
         }
         wtx.commit().map_err(st)?;
@@ -231,9 +232,9 @@ mod tests {
     fn log_append_read_first_last() {
         let s = RedbStore::in_memory().unwrap();
         s.append_log(&[
-            (1, b"a".to_vec()),
-            (2, b"b".to_vec()),
-            (3, b"c".to_vec()),
+            (1, Bytes::from_static(b"a")),
+            (2, Bytes::from_static(b"b")),
+            (3, Bytes::from_static(b"c")),
         ])
         .unwrap();
 
@@ -248,7 +249,7 @@ mod tests {
     fn truncate_and_purge() {
         let s = RedbStore::in_memory().unwrap();
         for i in 1..=5u64 {
-            s.append_log(&[(i, vec![i as u8])]).unwrap();
+            s.append_log(&[(i, Bytes::from(vec![i as u8]))]).unwrap();
         }
 
         s.truncate_log_from(4).unwrap();

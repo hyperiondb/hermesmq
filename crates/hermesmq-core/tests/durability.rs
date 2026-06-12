@@ -53,7 +53,7 @@ async fn restart_recovers_from_disk() {
                 topic: "t".into(),
                 priority: Priority::default(),
                 content_type: ContentType::Raw,
-                payload: b"durable".to_vec(),
+                payload: bytes::Bytes::from_static(b"durable"),
                 producer_id: "p1".to_string(),
                 seq: 1,
                 ts_ms: 0,
@@ -87,7 +87,7 @@ async fn restart_recovers_from_disk() {
         match polled.data {
             AppResponse::Polled { items } => {
                 assert_eq!(items.len(), 1, "message must survive restart");
-                assert_eq!(items[0].payload, b"durable");
+                assert_eq!(items[0].payload, &b"durable"[..]);
             }
             other => panic!("expected Polled, got {other:?}"),
         }
@@ -127,7 +127,7 @@ async fn concurrent_group_committed_writes_survive_restart() {
                         topic: "t".into(),
                         priority: Priority::default(),
                         content_type: ContentType::Raw,
-                        payload: vec![w as u8, i as u8],
+                        payload: bytes::Bytes::from(vec![w as u8, i as u8]),
                         producer_id: String::new(),
                         seq: 0,
                         ts_ms: 0,
@@ -199,7 +199,7 @@ async fn snapshot_then_restart_recovers_state() {
                 topic: "t".into(),
                 priority: Priority::default(),
                 content_type: ContentType::Raw,
-                payload: vec![i],
+                payload: bytes::Bytes::from(vec![i]),
                 producer_id: String::new(),
                 seq: 0,
                 ts_ms: 0,

@@ -34,7 +34,7 @@ fn produce_app(payload: Vec<u8>, priority: u8, ts_ms: u64) -> AppRequest {
         topic: TopicId::from("t"),
         priority: Priority(priority),
         content_type: ContentType::Raw,
-        payload,
+        payload: payload.into(),
         producer_id: String::new(),
         seq: 0,
         ts_ms,
@@ -146,7 +146,7 @@ fn produce_req(topic: &str, payload: Vec<u8>) -> Request {
             topic: topic.to_string(),
             priority: 0,
             content_type: 0,
-            payload,
+            payload: payload.into(),
             producer_id: String::new(),
             seq: 0,
         })),
@@ -378,6 +378,69 @@ async fn perf_subscribe_push_durable() {
             "subscribe push must be batch-bound, not one-raft-round-per-ack"
         );
         chart::record("tcp_sub", rate(N, dt), Some("prefetch 64".to_string()));
+        chart::render();
+    }
+
+    raft.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+#[ignore = "performance test; run with: cargo test --release --test perf -- --ignored --nocapture"]
+async fn perf_push_delivery_tail_latency() {
+    const N: usize = 2_000;
+    const PAYLOAD: usize = 256;
+
+    let dir = TempDir::new("lat");
+    let (raft, addr) = start_durable_node(&dir).await;
+
+    let mut sub = TcpStream::connect(addr).await.unwrap();
+    let subscribe = Request {
+        kind: Some(request::Kind::Subscribe(proto::Subscribe {
+            topic: "t".to_string(),
+            group: "g".to_string(),
+            prefetch: 16,
+            visibility_timeout_ms: 600_000,
+            ack_mode: "manual".to_string(),
+        })),
+    };
+    write_req(&mut sub, &subscribe).await;
+
+    let mut prod = TcpStream::connect(addr).await.unwrap();
+    let mut latencies = Vec::with_capacity(N);
+    for i in 0..N {
+        let started = Instant::now();
+        write_req(&mut prod, &produce_req("t", vec![0u8; PAYLOAD])).await;
+        let items = match read_resp(&mut sub).await.kind {
+            Some(response::Kind::Polled(p)) => p.items,
+            other => panic!("expected pushed Polled at msg {i}, got {other:?}"),
+        };
+        latencies.push(started.elapsed());
+        assert_eq!(items.len(), 1);
+        write_req(&mut sub, &ack_req("t", "g", items[0].lease_id)).await;
+        let resp = read_resp(&mut prod).await;
+        assert!(matches!(resp.kind, Some(response::Kind::Produced(_))));
+    }
+    latencies.sort();
+    let p50 = percentile(&latencies, 0.50);
+    let p99 = percentile(&latencies, 0.99);
+    let p999 = percentile(&latencies, 0.999);
+    let max = *latencies.last().unwrap();
+    println!(
+        "produce->push delivery latency: {N} msgs; p50={p50:?} p99={p99:?} p99.9={p999:?} max={max:?}"
+    );
+
+    if RELEASE {
+        assert!(
+            p999 < Duration::from_millis(150),
+            "push delivery p99.9 must not fall back to the 200ms wakeup backstop"
+        );
+        chart::record("lat_p50", p50.as_secs_f64() * 1e6, None);
+        chart::record("lat_p99", p99.as_secs_f64() * 1e6, None);
+        chart::record(
+            "lat_p999",
+            p999.as_secs_f64() * 1e6,
+            Some(format!("max {:.1} ms", max.as_secs_f64() * 1000.0)),
+        );
         chart::render();
     }
 

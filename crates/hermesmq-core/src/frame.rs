@@ -1,5 +1,6 @@
 use std::io;
 
+use bytes::{Bytes, BytesMut};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 pub(crate) const MAX_FRAME: usize = 64 * 1024 * 1024;
@@ -15,14 +16,14 @@ pub(crate) async fn write_frame<W: AsyncWriteExt + Unpin>(w: &mut W, bytes: &[u8
     Ok(())
 }
 
-pub(crate) async fn read_frame<R: AsyncReadExt + Unpin>(r: &mut R) -> io::Result<Vec<u8>> {
+pub(crate) async fn read_frame<R: AsyncReadExt + Unpin>(r: &mut R) -> io::Result<Bytes> {
     let mut len = [0u8; 4];
     r.read_exact(&mut len).await?;
     let n = u32::from_be_bytes(len) as usize;
     if n > MAX_FRAME {
         return Err(io::Error::new(io::ErrorKind::InvalidData, "frame exceeds maximum size"));
     }
-    let mut buf = vec![0u8; n];
+    let mut buf = BytesMut::zeroed(n);
     r.read_exact(&mut buf).await?;
-    Ok(buf)
+    Ok(buf.freeze())
 }

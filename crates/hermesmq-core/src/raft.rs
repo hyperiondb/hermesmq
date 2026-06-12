@@ -1,5 +1,6 @@
 use std::io::Cursor;
 
+use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 
 use crate::types::{ContentType, GroupId, LeaseId, Offset, Priority, TopicId};
@@ -10,7 +11,7 @@ pub enum AppRequest {
         topic: TopicId,
         priority: Priority,
         content_type: ContentType,
-        payload: Vec<u8>,
+        payload: Bytes,
         producer_id: String,
         seq: u64,
         ts_ms: u64,
@@ -73,7 +74,7 @@ pub struct ProduceItem {
     pub topic: TopicId,
     pub priority: Priority,
     pub content_type: ContentType,
-    pub payload: Vec<u8>,
+    pub payload: Bytes,
     pub producer_id: String,
     pub seq: u64,
     pub ts_ms: u64,
@@ -85,7 +86,7 @@ pub struct Delivered {
     pub offset: Offset,
     pub priority: Priority,
     pub content_type: ContentType,
-    pub payload: Vec<u8>,
+    pub payload: Bytes,
     pub ts_ms: u64,
 }
 

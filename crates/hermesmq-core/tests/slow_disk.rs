@@ -19,7 +19,7 @@ impl LatencyStore {
 }
 
 impl Storage for LatencyStore {
-    fn append_log(&self, entries: &[(u64, Vec<u8>)]) -> Result<()> {
+    fn append_log(&self, entries: &[(u64, bytes::Bytes)]) -> Result<()> {
         self.slow();
         self.inner.append_log(entries)
     }
@@ -85,7 +85,7 @@ fn produce(body: &[u8]) -> AppRequest {
         topic: TopicId::from("t"),
         priority: Priority::default(),
         content_type: ContentType::Raw,
-        payload: body.to_vec(),
+        payload: bytes::Bytes::copy_from_slice(body),
         producer_id: String::new(),
         seq: 0,
         ts_ms: 0,

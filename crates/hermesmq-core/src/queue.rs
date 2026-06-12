@@ -468,6 +468,7 @@ fn commit(topics: &mut BTreeMap<String, TopicState>, topic: &str, group: &str, o
 mod tests {
     use super::*;
     use crate::types::{ContentType, GroupId, Priority, TopicId};
+    use bytes::Bytes;
     use proptest::prelude::*;
 
     fn produce(q: &mut Queue, topic: &str, priority: u8, body: &[u8], producer: &str, seq: u64) -> Offset {
@@ -475,7 +476,7 @@ mod tests {
             topic: TopicId::from(topic),
             priority: Priority(priority),
             content_type: ContentType::Raw,
-            payload: body.to_vec(),
+            payload: Bytes::copy_from_slice(body),
             producer_id: producer.to_string(),
             seq,
             ts_ms: 0,
@@ -628,7 +629,7 @@ mod tests {
             topic: TopicId::from("t"),
             priority: Priority(0),
             content_type: ContentType::Raw,
-            payload: b"old".to_vec(),
+            payload: Bytes::from_static(b"old"),
             producer_id: String::new(),
             seq: 0,
             ts_ms: 0,
@@ -637,7 +638,7 @@ mod tests {
             topic: TopicId::from("t"),
             priority: Priority(0),
             content_type: ContentType::Raw,
-            payload: b"new".to_vec(),
+            payload: Bytes::from_static(b"new"),
             producer_id: String::new(),
             seq: 0,
             ts_ms: 5000,
@@ -686,7 +687,7 @@ mod tests {
             topic: TopicId::from("t"),
             priority: Priority(0),
             content_type: ContentType::Raw,
-            payload: payload.to_vec(),
+            payload: Bytes::copy_from_slice(payload),
             producer_id: producer.to_string(),
             seq,
             ts_ms: 0,
@@ -793,7 +794,7 @@ mod tests {
                     topic: TopicId::from("t"),
                     priority: Priority(0),
                     content_type: ContentType::Raw,
-                    payload: vec![*k],
+                    payload: Bytes::from(vec![*k]),
                     producer_id: producer,
                     seq: 0,
                     ts_ms: i as u64,

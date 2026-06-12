@@ -3,6 +3,7 @@ use std::fmt::Debug;
 use std::ops::{Bound, RangeBounds};
 use std::sync::{Arc, Mutex};
 
+use bytes::Bytes;
 use openraft::storage::{LogFlushed, RaftLogReader, RaftLogStorage};
 use openraft::{Entry, LogId, LogState, OptionalSend, StorageError, Vote};
 use tokio::sync::{mpsc, oneshot};
@@ -18,13 +19,13 @@ const FLUSH_MAX_ENTRIES: usize = 512;
 const FLUSH_MAX_BYTES: usize = 8 * 1024 * 1024;
 
 enum FlushJob {
-    Append(Vec<(u64, Vec<u8>)>, LogFlushed<TypeConfig>),
+    Append(Vec<(u64, Bytes)>, LogFlushed<TypeConfig>),
     Barrier(oneshot::Sender<()>),
 }
 
 struct Shared<S> {
     db: Arc<S>,
-    pending: Mutex<BTreeMap<u64, Vec<u8>>>,
+    pending: Mutex<BTreeMap<u64, Bytes>>,
 }
 
 pub struct LogStore<S = RedbStore> {
@@ -73,7 +74,7 @@ impl<S: Storage> LogStore<S> {
 
 fn run_flusher<S: Storage>(shared: Arc<Shared<S>>, mut rx: mpsc::UnboundedReceiver<FlushJob>) {
     while let Some(first) = rx.blocking_recv() {
-        let mut batch: Vec<(u64, Vec<u8>)> = Vec::new();
+        let mut batch: Vec<(u64, Bytes)> = Vec::new();
         let mut callbacks = Vec::new();
         let mut barriers = Vec::new();
         let mut bytes = 0usize;
@@ -151,9 +152,9 @@ impl<S: Storage> RaftLogReader<TypeConfig> for LogStore<S> {
             }
         };
 
-        let mut merged: BTreeMap<u64, Vec<u8>> = BTreeMap::new();
+        let mut merged: BTreeMap<u64, Bytes> = BTreeMap::new();
         for (index, bytes) in self.shared.db.read_log(start, end).map_err(sread)? {
-            merged.insert(index, bytes);
+            merged.insert(index, Bytes::from(bytes));
         }
         {
             let pending = self.shared.pending.lock().unwrap();
@@ -195,7 +196,7 @@ impl<S: Storage> RaftLogStorage<TypeConfig> for LogStore<S> {
                         .map_err(sread)?
                         .into_iter()
                         .next()
-                        .map(|(_, b)| b),
+                        .map(|(_, b)| Bytes::from(b)),
                 };
                 match bytes {
                     Some(b) => Some(dec::<Entry<TypeConfig>>(&b)?.log_id),
@@ -253,7 +254,7 @@ impl<S: Storage> RaftLogStorage<TypeConfig> for LogStore<S> {
     {
         let mut batch = Vec::new();
         for entry in entries {
-            batch.push((entry.log_id.index, enc(&entry)?));
+            batch.push((entry.log_id.index, Bytes::from(enc(&entry)?)));
         }
         {
             let mut pending = self.shared.pending.lock().unwrap();

@@ -316,7 +316,8 @@ cargo perf
 
 Prints throughput and latency percentiles, and asserts loose floors (release builds only) to catch
 catastrophic regressions: queue state-machine ops, sequential / concurrent / pipelined produce
-against a single fsync-backed node, poll/ack drain, subscribe push, and 3-node replicated writes.
+against a single fsync-backed node, poll/ack drain, subscribe push, produce-to-delivery push tail
+latency (p50/p99/p99.9), and 3-node replicated writes.
 (Alias for `cargo test -p hermesmq-core --release --test perf -- --ignored --nocapture --test-threads=1`.)
 
 ## Caveats
