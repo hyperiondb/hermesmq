@@ -209,12 +209,19 @@ struct Ctx {
 
 impl Ctx {
     fn notifier(&self, topic: &str) -> Arc<Notify> {
-        self.notifiers
-            .lock()
-            .unwrap()
-            .entry(topic.to_string())
+        let mut map = self.notifiers.lock().unwrap();
+        gc_notifiers(&mut map);
+        map.entry(topic.to_string())
             .or_insert_with(|| Arc::new(Notify::new()))
             .clone()
+    }
+}
+
+const NOTIFIER_GC_THRESHOLD: usize = 4096;
+
+fn gc_notifiers(map: &mut HashMap<String, Arc<Notify>>) {
+    if map.len() > NOTIFIER_GC_THRESHOLD {
+        map.retain(|_, n| Arc::strong_count(n) > 1);
     }
 }
 
@@ -995,5 +1002,31 @@ async fn handle_client(ctx: Ctx, stream: TcpStream) -> io::Result<()> {
     match sub {
         Some(sub) => handle_subscribe(ctx, read_half, write_half, sub).await,
         None => Ok(()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn gc_notifiers_drops_entries_without_waiters() {
+        let mut map: HashMap<String, Arc<Notify>> = HashMap::new();
+        for i in 0..=NOTIFIER_GC_THRESHOLD {
+            map.insert(format!("t{i}"), Arc::new(Notify::new()));
+        }
+        let live = map.get("t0").cloned().unwrap();
+        gc_notifiers(&mut map);
+        assert!(map.contains_key("t0"), "a topic with a live waiter must survive");
+        assert_eq!(map.len(), 1, "notifiers with no waiters are reclaimed");
+        drop(live);
+    }
+
+    #[test]
+    fn gc_notifiers_is_a_noop_below_threshold() {
+        let mut map: HashMap<String, Arc<Notify>> = HashMap::new();
+        map.insert("t".to_string(), Arc::new(Notify::new()));
+        gc_notifiers(&mut map);
+        assert_eq!(map.len(), 1);
     }
 }

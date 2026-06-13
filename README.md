@@ -127,13 +127,34 @@ await client.createTopic({
 ```
 
 **`produce(options) → offset`** — append a message to a topic; returns the assigned offset (string).
-`priority` is **per-message** (each message carries its own).
+`priority` is **per-message** (each message carries its own). Optional `producerId` + `seq` (a
+per-producer monotonic counter) make retries idempotent: a re-send with the same pair returns the
+original offset instead of appending a duplicate. All produces share one pipelined connection to
+the leader (up to 32 in flight) and are group-committed, so concurrent produces scale to thousands
+of msg/s while a serial `await` loop is bound to one Raft round per message.
 ```js
 const offset = await client.produce({
   topic: "orders",
   body: Buffer.from("hello"),  // payload is opaque bytes
   priority: 0,                 // 0 = lowest .. 7 = highest (default 0)
+  producerId: "billing-7f3a",  // optional: enables dedup; requires seq
+  seq: 42,                     // optional: per-producer monotonic counter
 });
+```
+
+**`produceMany(items) → results[]`** — produce a batch concurrently through the pipeline; returns
+per-item `{ offset?, error? }` aligned with the input, so partial failures are visible. Pair with
+`producerId`/`seq` and retry only the failed items with their original seqs — items that already
+committed dedup to their original offsets.
+```js
+const results = await client.produceMany(
+  orders.map((order, i) => ({
+    topic: "orders",
+    body: Buffer.from(JSON.stringify(order)),
+    producerId: "billing-7f3a",
+    seq: base + i,
+  })),
+);
 ```
 
 **`poll(options) → messages[]`** — lease up to `max` deliverable messages for a `(topic, group)`.
@@ -324,8 +345,13 @@ latency (p50/p99/p99.9), and 3-node replicated writes.
 
 - The TCP and peer-RPC ports have **no auth/TLS** — only run on a trusted/private network. Add a
   token + TLS before any untrusted exposure, and firewall the peer port to cluster hosts only.
-- Retention is **Kafka-style**: it drops messages by age/size regardless of consumption, so a lagging
+- Memory is reclaimed two ways. Messages that **every** group has acked past are dropped
+  automatically (consumption-based), so a fully-drained topic costs nothing. On top of that,
+  retention is **Kafka-style**: it drops messages by age/size regardless of consumption, so a lagging
   group can lose un-consumed messages. Set generous retention if that matters.
+- A topic that sets **no** retention still gets a default safety cap of 1,000,000 messages, so an
+  un-consumed (or never-acked) topic can't grow unbounded in RAM. Set explicit `retention` to raise,
+  lower, or age-bound it.
 - Reads (`poll`) go through the leader; followers redirect.
 
 ## License

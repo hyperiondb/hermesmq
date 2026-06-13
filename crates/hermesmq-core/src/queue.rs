@@ -7,6 +7,8 @@ use crate::types::{LeaseId, Message, Offset, Priority};
 
 const DEDUP_CAPACITY: usize = 100_000;
 const RESERVED_DEN: u64 = 4;
+const DEFAULT_RETAIN_MAX_MESSAGES: u64 = 1_000_000;
+const GROUP_GC_THRESHOLD: usize = 1024;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct Lease {
@@ -151,6 +153,7 @@ impl Queue {
                 lease_id,
             } => {
                 ack(&mut self.topics, &topic.0, &group.0, lease_id);
+                reclaim_topic(&mut self.topics, &topic.0);
                 AppResponse::Acked
             }
             AppRequest::AckMany {
@@ -161,6 +164,7 @@ impl Queue {
                 for lease_id in lease_ids {
                     ack(&mut self.topics, &topic.0, &group.0, lease_id);
                 }
+                reclaim_topic(&mut self.topics, &topic.0);
                 AppResponse::Acked
             }
             AppRequest::NackMany {
@@ -187,6 +191,7 @@ impl Queue {
                 offset,
             } => {
                 commit(&mut self.topics, &topic.0, &group.0, offset);
+                reclaim_topic(&mut self.topics, &topic.0);
                 AppResponse::Committed
             }
             AppRequest::SetRateLimit {
@@ -406,22 +411,28 @@ fn nack(topics: &mut BTreeMap<String, TopicState>, topic: &str, group: &str, lea
     }
 }
 
-fn purge_retained(t: &mut TopicState, now_ms: u64) {
-    if t.retain_max_age_ms == 0 && t.retain_max_messages == 0 {
-        return;
+fn effective_retention(t: &TopicState) -> (u64, u64) {
+    if t.retain_max_messages == 0 && t.retain_max_age_ms == 0 {
+        (DEFAULT_RETAIN_MAX_MESSAGES, 0)
+    } else {
+        (t.retain_max_messages, t.retain_max_age_ms)
     }
+}
+
+fn purge_retained(t: &mut TopicState, now_ms: u64) {
+    let (max_messages, max_age_ms) = effective_retention(t);
     let mut purge: BTreeSet<Offset> = BTreeSet::new();
-    if t.retain_max_age_ms > 0 {
+    if max_age_ms > 0 {
         for (offset, message) in t.messages.iter() {
-            if now_ms.saturating_sub(message.ts_ms) > t.retain_max_age_ms {
+            if now_ms.saturating_sub(message.ts_ms) > max_age_ms {
                 purge.insert(*offset);
             } else {
                 break;
             }
         }
     }
-    if t.retain_max_messages > 0 {
-        let target = t.retain_max_messages as usize;
+    if max_messages > 0 {
+        let target = max_messages as usize;
         let kept = t.messages.len() - purge.len();
         if kept > target {
             let mut need = kept - target;
@@ -447,6 +458,34 @@ fn purge_retained(t: &mut TopicState, now_ms: u64) {
             g.advance_watermark(boundary);
         }
     }
+}
+
+fn reclaim_topic(topics: &mut BTreeMap<String, TopicState>, topic: &str) {
+    if let Some(t) = topics.get_mut(topic) {
+        reclaim(t);
+    }
+}
+
+fn reclaim(t: &mut TopicState) {
+    if let Some(boundary) = t.groups.values().map(|g| g.ack_watermark).min() {
+        if t.messages.keys().next().is_some_and(|first| boundary > *first) {
+            t.messages = t.messages.split_off(&boundary);
+        }
+    }
+    gc_idle_groups(t);
+}
+
+fn gc_idle_groups(t: &mut TopicState) {
+    if t.groups.len() <= GROUP_GC_THRESHOLD || !t.messages.is_empty() {
+        return;
+    }
+    let next = t.next_offset;
+    t.groups.retain(|_, g| {
+        !(g.ack_watermark >= next
+            && g.in_flight.is_empty()
+            && g.leased_offsets.is_empty()
+            && g.acked_above.is_empty())
+    });
 }
 
 fn group_entry<'a>(t: &'a mut TopicState, group: &str) -> &'a mut GroupState {
@@ -678,6 +717,167 @@ mod tests {
         assert!(g.acked_above.is_empty(), "acked_above must drain once the watermark advances");
         assert!(g.in_flight.is_empty());
         assert!(g.leased_offsets.is_empty());
+    }
+
+    #[test]
+    fn fully_acked_messages_are_reclaimed_from_memory() {
+        let mut q = Queue::default();
+        for i in 0..10 {
+            produce(&mut q, "t", 0, &[i], "", 0);
+        }
+        assert_eq!(q.metrics().messages, 10);
+        let leased = poll_offsets(&mut q, "t", "g", 100, 1000, 0);
+        for (lease_id, _) in leased {
+            q.apply(AppRequest::Ack {
+                topic: TopicId::from("t"),
+                group: GroupId::from("g"),
+                lease_id,
+            });
+        }
+        assert_eq!(q.metrics().messages, 0, "fully acked messages must be freed from RAM");
+    }
+
+    #[test]
+    fn reclaim_holds_the_line_for_the_slowest_group() {
+        let mut q = Queue::default();
+        for i in 0..10 {
+            produce(&mut q, "t", 0, &[i], "", 0);
+        }
+        let _g2_registers = poll_offsets(&mut q, "t", "g2", 1, 1_000_000, 0);
+        let leased = poll_offsets(&mut q, "t", "g1", 100, 1000, 0);
+        for (lease_id, _) in leased {
+            q.apply(AppRequest::Ack {
+                topic: TopicId::from("t"),
+                group: GroupId::from("g1"),
+                lease_id,
+            });
+        }
+        assert_eq!(
+            q.metrics().messages,
+            10,
+            "messages must be retained while g2 still lags"
+        );
+        q.apply(AppRequest::CommitOffset {
+            topic: TopicId::from("t"),
+            group: GroupId::from("g2"),
+            offset: 10,
+        });
+        assert_eq!(
+            q.metrics().messages,
+            0,
+            "memory is freed once every group has consumed past the messages"
+        );
+    }
+
+    #[test]
+    fn unconsumed_topic_is_never_reclaimed() {
+        let mut q = Queue::default();
+        for i in 0..5 {
+            produce(&mut q, "t", 0, &[i], "", 0);
+        }
+        assert_eq!(q.metrics().messages, 5, "no groups means nothing is consumed yet");
+    }
+
+    #[test]
+    fn drained_topic_sheds_idle_caught_up_groups() {
+        let mut t = TopicState::default();
+        t.next_offset = 10;
+        for i in 0..(GROUP_GC_THRESHOLD + 5) {
+            t.groups.insert(
+                format!("g{i}"),
+                GroupState {
+                    ack_watermark: 10,
+                    ..GroupState::default()
+                },
+            );
+        }
+        gc_idle_groups(&mut t);
+        assert!(t.groups.is_empty(), "a drained topic must forget caught-up idle groups");
+    }
+
+    #[test]
+    fn small_group_counts_are_left_alone() {
+        let mut t = TopicState::default();
+        t.next_offset = 10;
+        t.groups.insert(
+            "g".to_string(),
+            GroupState {
+                ack_watermark: 10,
+                ..GroupState::default()
+            },
+        );
+        gc_idle_groups(&mut t);
+        assert_eq!(t.groups.len(), 1, "below the threshold nothing is touched");
+    }
+
+    #[test]
+    fn group_holding_a_lease_or_lagging_survives_gc() {
+        let mut t = TopicState::default();
+        t.next_offset = 10;
+        for i in 0..(GROUP_GC_THRESHOLD + 1) {
+            t.groups.insert(
+                format!("g{i}"),
+                GroupState {
+                    ack_watermark: 10,
+                    ..GroupState::default()
+                },
+            );
+        }
+        let mut leased = GroupState {
+            ack_watermark: 10,
+            ..GroupState::default()
+        };
+        leased.in_flight.insert(1, Lease { offset: 5, deadline_ms: 0 });
+        t.groups.insert("leased".to_string(), leased);
+        t.groups.insert(
+            "lagging".to_string(),
+            GroupState {
+                ack_watermark: 3,
+                ..GroupState::default()
+            },
+        );
+        gc_idle_groups(&mut t);
+        assert!(t.groups.contains_key("leased"), "a group with an in-flight lease must be kept");
+        assert!(t.groups.contains_key("lagging"), "a lagging group must be kept");
+        assert_eq!(t.groups.len(), 2);
+    }
+
+    #[test]
+    fn default_retention_cap_applies_when_unset() {
+        let t = TopicState::default();
+        assert_eq!(effective_retention(&t), (DEFAULT_RETAIN_MAX_MESSAGES, 0));
+    }
+
+    #[test]
+    fn explicit_retention_overrides_default_cap() {
+        let mut by_count = TopicState::default();
+        by_count.retain_max_messages = 50;
+        assert_eq!(effective_retention(&by_count), (50, 0));
+
+        let mut by_age = TopicState::default();
+        by_age.retain_max_age_ms = 1000;
+        assert_eq!(effective_retention(&by_age), (0, 1000));
+    }
+
+    #[test]
+    fn default_cap_bounds_an_unconsumed_topic() {
+        let mut t = TopicState::default();
+        for offset in 0..(DEFAULT_RETAIN_MAX_MESSAGES + 5) {
+            t.messages.insert(
+                offset,
+                Message {
+                    offset,
+                    priority: Priority(0),
+                    content_type: ContentType::Raw,
+                    payload: Bytes::new(),
+                    ts_ms: 0,
+                },
+            );
+            t.next_offset = offset + 1;
+        }
+        purge_retained(&mut t, 0);
+        assert_eq!(t.messages.len() as u64, DEFAULT_RETAIN_MAX_MESSAGES);
+        assert_eq!(t.messages.keys().next().copied(), Some(5));
     }
 
     #[test]

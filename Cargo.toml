@@ -3,7 +3,7 @@ resolver = "2"
 members = ["crates/hermesmq", "crates/hermesmq-core", "crates/hermesmq-proto", "crates/hermesmqd"]
 
 [workspace.package]
-version = "0.5.0"
+version = "0.6.0"
 edition = "2021"
 license = "GPL-3.0-or-later"
 authors = ["Tadas Talaikis <info@nordlet.com>"]
@@ -11,6 +11,7 @@ repository = "https://github.com/hyperiondb/hermesmq"
 readme = "README.md"
 keywords = ["message-queue", "message-broker", "messaging", "raft", "pubsub"]
 categories = ["asynchronous", "database-implementations", "network-programming"]
+homepage="https://hyperiondb.eu/"
 
 [workspace.dependencies]
 bytes = { version = "=1.11.1", features = ["serde"] }
