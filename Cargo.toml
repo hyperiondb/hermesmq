@@ -3,9 +3,9 @@ resolver = "2"
 members = ["crates/hermesmq", "crates/hermesmq-core", "crates/hermesmq-proto", "crates/hermesmqd"]
 
 [workspace.package]
-version = "0.6.0"
+version = "0.6.1"
 edition = "2021"
-license = "GPL-3.0-or-later"
+license = "AGPL-3.0-only"
 authors = ["Tadas Talaikis <info@nordlet.com>"]
 repository = "https://github.com/hyperiondb/hermesmq"
 readme = "README.md"
