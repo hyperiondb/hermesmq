@@ -152,6 +152,9 @@ impl<S: Storage> RaftStateMachine<TypeConfig> for StateMachineStore<S> {
             data: bytes,
         };
         persist_snapshot(self.db.as_ref(), &stored)?;
+        if let Some(last) = meta.last_log_id {
+            super::log_store::mark_purged(self.db.as_ref(), &last)?;
+        }
         self.inner.lock().unwrap().data = data;
         Ok(())
     }
@@ -169,6 +172,78 @@ impl<S: Storage> RaftStateMachine<TypeConfig> for StateMachineStore<S> {
             }
             None => Ok(None),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use openraft::storage::{RaftLogStorage, RaftStateMachine};
+    use openraft::{CommittedLeaderId, LogId};
+
+    fn log_id(term: u64, index: u64) -> LogId<NodeId> {
+        LogId::new(CommittedLeaderId::new(term, 1), index)
+    }
+
+    #[tokio::test]
+    async fn install_snapshot_advances_the_purged_pointer() {
+        let db = Arc::new(RedbStore::in_memory().unwrap());
+        let mut sm = StateMachineStore::new(db.clone()).unwrap();
+        let mut log = super::super::LogStore::new(db.clone());
+
+        let last = log_id(3615, 194078);
+        let bytes = enc(&StateMachineData::default()).unwrap();
+        let meta = SnapshotMeta {
+            last_log_id: Some(last),
+            last_membership: StoredMembership::default(),
+            snapshot_id: "snap-1".to_string(),
+        };
+
+        sm.install_snapshot(&meta, Box::new(Cursor::new(bytes)))
+            .await
+            .unwrap();
+
+        let state = log.get_log_state().await.unwrap();
+        assert_eq!(
+            state.last_purged_log_id,
+            Some(last),
+            "a snapshot install on a wiped node must advance the log's purged pointer"
+        );
+        assert_eq!(
+            state.last_log_id,
+            Some(last),
+            "with no log entries yet, last_log_id tracks the snapshot boundary"
+        );
+    }
+
+    #[tokio::test]
+    async fn purge_pointer_never_moves_backwards() {
+        let db = Arc::new(RedbStore::in_memory().unwrap());
+        let mut sm = StateMachineStore::new(db.clone()).unwrap();
+        let mut log = super::super::LogStore::new(db.clone());
+
+        let newer = log_id(3615, 200000);
+        let meta_new = SnapshotMeta {
+            last_log_id: Some(newer),
+            last_membership: StoredMembership::default(),
+            snapshot_id: "snap-new".to_string(),
+        };
+        sm.install_snapshot(&meta_new, Box::new(Cursor::new(enc(&StateMachineData::default()).unwrap())))
+            .await
+            .unwrap();
+
+        let older = log_id(3615, 194078);
+        let meta_old = SnapshotMeta {
+            last_log_id: Some(older),
+            last_membership: StoredMembership::default(),
+            snapshot_id: "snap-old".to_string(),
+        };
+        sm.install_snapshot(&meta_old, Box::new(Cursor::new(enc(&StateMachineData::default()).unwrap())))
+            .await
+            .unwrap();
+
+        let state = log.get_log_state().await.unwrap();
+        assert_eq!(state.last_purged_log_id, Some(newer), "a stale snapshot must not lower the purged pointer");
     }
 }
 

@@ -59,8 +59,17 @@ async fn handle_conn(raft: HermesRaft, mut stream: TcpStream) -> io::Result<()> 
                 PeerResponse::InstallSnapshot(raft.install_snapshot(r).await)
             }
         };
+        let stopped = matches!(
+            &resp,
+            PeerResponse::AppendEntries(Err(RaftError::Fatal(_)))
+                | PeerResponse::Vote(Err(RaftError::Fatal(_)))
+                | PeerResponse::InstallSnapshot(Err(RaftError::Fatal(_)))
+        );
         let resp_bytes = postcard::to_stdvec(&resp).map_err(to_io)?;
         write_frame(&mut stream, &resp_bytes).await?;
+        if stopped {
+            return Ok(());
+        }
     }
 }
 

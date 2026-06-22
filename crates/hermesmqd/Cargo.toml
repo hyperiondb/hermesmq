@@ -13,7 +13,7 @@ name = "hermesmqd"
 path = "src/main.rs"
 
 [dependencies]
-hermesmq-core = { path = "../hermesmq-core", version = "=0.6.1" }
+hermesmq-core = { path = "../hermesmq-core", version = "=0.6.2" }
 tokio.workspace = true
 anyhow.workspace = true
 clap.workspace = true

@@ -14,7 +14,7 @@ use crate::storage::Storage;
 use crate::types::NodeId;
 use crate::RedbStore;
 
-const KEY_PURGED: &str = "log:purged";
+pub(crate) const KEY_PURGED: &str = "log:purged";
 const FLUSH_MAX_ENTRIES: usize = 512;
 const FLUSH_MAX_BYTES: usize = 8 * 1024 * 1024;
 
@@ -126,6 +126,20 @@ fn run_flusher<S: Storage>(shared: Arc<Shared<S>>, mut rx: mpsc::UnboundedReceiv
             let _ = done.send(());
         }
     }
+}
+
+pub(crate) fn mark_purged<S: Storage>(
+    db: &S,
+    upto: &LogId<NodeId>,
+) -> Result<(), StorageError<NodeId>> {
+    if let Some(bytes) = db.get(KEY_PURGED).map_err(sread)? {
+        let current: LogId<NodeId> = dec(&bytes)?;
+        if current.index >= upto.index {
+            return Ok(());
+        }
+    }
+    db.put(KEY_PURGED, &enc(upto)?).map_err(swrite)?;
+    db.purge_log_upto(upto.index).map_err(swrite)
 }
 
 impl<S: Storage> RaftLogReader<TypeConfig> for LogStore<S> {
@@ -282,8 +296,6 @@ impl<S: Storage> RaftLogStorage<TypeConfig> for LogStore<S> {
     }
 
     async fn purge(&mut self, log_id: LogId<NodeId>) -> Result<(), StorageError<NodeId>> {
-        let bytes = enc(&log_id)?;
-        self.shared.db.put(KEY_PURGED, &bytes).map_err(swrite)?;
-        self.shared.db.purge_log_upto(log_id.index).map_err(swrite)
+        mark_purged(self.shared.db.as_ref(), &log_id)
     }
 }

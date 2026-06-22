@@ -1,5 +1,6 @@
+use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use hermesmq_core::engine::{
     add_learner, build_raft, build_raft_partitionable, initialize_cluster, serve_peer, set_voters,
@@ -228,6 +229,97 @@ async fn cluster_tolerates_follower_loss() {
         }
         other => panic!("expected Polled, got {other:?}"),
     }
+}
+
+async fn snapshot_index(raft: &HermesRaft) -> u64 {
+    for _ in 0..200 {
+        if let Some(i) = raft.metrics().borrow().snapshot.as_ref().map(|l| l.index) {
+            return i;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!("snapshot was not built within timeout");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn wiped_node_recovers_via_snapshot_and_survives_restart() {
+    let (r1, a1) = spawn_node(1).await;
+    let (r2, a2) = spawn_node(2).await;
+    initialize_cluster(&r1, &[(1, a1), (2, a2)]).await.unwrap();
+
+    let voters = [(1u64, &r1), (2, &r2)];
+    let leader_id = wait_for_leader(&voters).await;
+    let leader = pick(&voters, leader_id);
+
+    leader
+        .client_write(AppRequest::CreateTopic { topic: TopicId::from("t") })
+        .await
+        .unwrap();
+    for _ in 0..5 {
+        leader.client_write(produce_req("snapshotted")).await.unwrap();
+    }
+    leader.trigger().snapshot().await.unwrap();
+    let snap_idx = snapshot_index(leader).await;
+    for _ in 0..5 {
+        leader.client_write(produce_req("trailing")).await.unwrap();
+    }
+    let target = last_applied_index(leader);
+    leader.trigger().purge_log(snap_idx).await.unwrap();
+
+    let nanos = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+    let dir: PathBuf = std::env::temp_dir().join(format!("hermesmq-wipe-{nanos}"));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("hermesmq.redb");
+
+    let a3 = {
+        let db = Arc::new(RedbStore::open(&path).unwrap());
+        let (r3, _sm3) = build_raft(3, db).await.unwrap();
+        let l3 = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = l3.local_addr().unwrap().to_string();
+        let serve = tokio::spawn(serve_peer(r3.clone(), l3));
+        add_learner(leader, 3, addr.clone()).await.unwrap();
+        wait_applied(&r3, target).await;
+        r3.shutdown().await.unwrap();
+        serve.abort();
+        addr
+    };
+
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let db = Arc::new(RedbStore::open(&path).unwrap());
+    let (r3c, _sm3c) = build_raft(3, db).await.unwrap();
+    let l3 = {
+        let mut bound = None;
+        for _ in 0..100 {
+            if let Ok(l) = TcpListener::bind(&a3).await {
+                bound = Some(l);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        bound.expect("port frees up after the dead node releases its listener")
+    };
+    tokio::spawn(serve_peer(r3c.clone(), l3));
+
+    for _ in 0..3 {
+        leader.client_write(produce_req("after-restart")).await.unwrap();
+    }
+    let target2 = last_applied_index(leader);
+
+    for _ in 0..200 {
+        if last_applied_index(&r3c) >= target2 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let reached = last_applied_index(&r3c);
+    let snap = r3c.metrics().borrow().snapshot.as_ref().map(|l| l.index);
+    r3c.shutdown().await.ok();
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(
+        reached >= target2,
+        "restarted node stuck: applied={reached}, snapshot={snap:?}, snap_idx={snap_idx}, target2={target2}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
