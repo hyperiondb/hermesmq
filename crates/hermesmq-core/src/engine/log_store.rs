@@ -251,9 +251,30 @@ impl<S: Storage> RaftLogStorage<TypeConfig> for LogStore<S> {
     }
 
     async fn read_committed(&mut self) -> Result<Option<LogId<NodeId>>, StorageError<NodeId>> {
-        match self.shared.db.read_committed().map_err(sread)? {
-            Some(b) => dec::<Option<LogId<NodeId>>>(&b),
-            None => Ok(None),
+        let stored: Option<LogId<NodeId>> = match self.shared.db.read_committed().map_err(sread)? {
+            Some(b) => dec(&b)?,
+            None => return Ok(None),
+        };
+        let Some(committed) = stored else { return Ok(None) };
+
+        // Never advertise a commit the log can't serve. If `committed` points
+        // past the last persisted entry, the tail was lost; returning it would
+        // make openraft re-apply `(last_applied .. committed]` over entries that
+        // aren't on disk and abort startup with "Failed to get log entries".
+        // The committed pointer is a recoverable optimization: a follower
+        // re-learns it from the leader, and a node that re-wins leadership
+        // re-commits its own log.
+        let last = self
+            .shared
+            .db
+            .last_log_index()
+            .map_err(sread)?
+            .into_iter()
+            .chain(self.pending_last())
+            .max();
+        match last {
+            Some(last_index) if committed.index <= last_index => Ok(Some(committed)),
+            _ => Ok(None),
         }
     }
 
@@ -296,6 +317,51 @@ impl<S: Storage> RaftLogStorage<TypeConfig> for LogStore<S> {
     }
 
     async fn purge(&mut self, log_id: LogId<NodeId>) -> Result<(), StorageError<NodeId>> {
+        self.barrier().await;
+        {
+            let mut pending = self.shared.pending.lock().unwrap();
+            *pending = pending.split_off(&(log_id.index + 1));
+        }
         mark_purged(self.shared.db.as_ref(), &log_id)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use openraft::CommittedLeaderId;
+
+    fn log_id(index: u64) -> LogId<NodeId> {
+        LogId::new(CommittedLeaderId::new(3615, 3), index)
+    }
+
+    #[tokio::test]
+    async fn read_committed_drops_a_pointer_past_the_available_log() {
+        let db = Arc::new(RedbStore::in_memory().unwrap());
+        db.save_committed(&enc(&Some(log_id(196780))).unwrap()).unwrap();
+        let mut log = LogStore::new(db);
+        assert_eq!(
+            log.read_committed().await.unwrap(),
+            None,
+            "a committed pointer with no backing log must not be trusted"
+        );
+    }
+
+    #[tokio::test]
+    async fn read_committed_keeps_a_pointer_covered_by_the_log() {
+        let db = Arc::new(RedbStore::in_memory().unwrap());
+        db.append_log(&[(1, Bytes::from_static(b"a")), (2, Bytes::from_static(b"b"))])
+            .unwrap();
+        db.save_committed(&enc(&Some(log_id(2))).unwrap()).unwrap();
+        let mut log = LogStore::new(db);
+        assert_eq!(log.read_committed().await.unwrap(), Some(log_id(2)));
+    }
+
+    #[tokio::test]
+    async fn build_raft_starts_despite_committed_past_a_lost_log() {
+        let db = Arc::new(RedbStore::in_memory().unwrap());
+        db.save_committed(&enc(&Some(log_id(196780))).unwrap()).unwrap();
+        let (raft, _sm) = super::super::build_raft(3, db).await.unwrap();
+        raft.shutdown().await.unwrap();
     }
 }

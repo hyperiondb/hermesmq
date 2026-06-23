@@ -9,7 +9,7 @@ const LOG: TableDefinition<u64, &[u8]> = TableDefinition::new("raft_log");
 const META: TableDefinition<&str, &[u8]> = TableDefinition::new("meta");
 
 const KEY_VOTE: &str = "sys:vote";
-const KEY_COMMITTED: &str = "sys:committed";
+pub(crate) const KEY_COMMITTED: &str = "sys:committed";
 
 fn st<E: std::fmt::Display>(e: E) -> Error {
     Error::Storage(e.to_string())
@@ -271,6 +271,27 @@ mod tests {
 
         s.save_committed(b"c-1").unwrap();
         assert_eq!(s.read_committed().unwrap(), Some(b"c-1".to_vec()));
+    }
+
+    #[test]
+    fn log_keys_order_numerically_past_byte_boundaries() {
+        // redb must order u64 log keys numerically, not by raw little-endian
+        // bytes — otherwise first()/last()/range() break past 256/65536 and the
+        // Raft log's notion of "last entry" silently corrupts at scale.
+        let s = RedbStore::in_memory().unwrap();
+        let mut idx: Vec<u64> = (0..70_000u64).collect();
+        idx.sort_by_key(|k| k.wrapping_mul(2654435761) & 0xffff); // shuffle inserts
+        for chunk in idx.chunks(4096) {
+            let batch: Vec<(u64, Bytes)> =
+                chunk.iter().map(|&i| (i, Bytes::from(i.to_le_bytes().to_vec()))).collect();
+            s.append_log(&batch).unwrap();
+        }
+        assert_eq!(s.first_log_index().unwrap(), Some(0));
+        assert_eq!(s.last_log_index().unwrap(), Some(69_999));
+        for (lo, hi) in [(0u64, 64u64), (250, 260), (65_530, 65_540)] {
+            let got: Vec<u64> = s.read_log(lo, hi).unwrap().iter().map(|(k, _)| *k).collect();
+            assert_eq!(got, (lo..hi).collect::<Vec<_>>(), "range({lo}..{hi}) out of order");
+        }
     }
 
     #[test]

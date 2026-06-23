@@ -15,7 +15,7 @@ use crate::storage::Storage;
 use crate::types::NodeId;
 use crate::{AppResponse, RedbStore};
 
-const KEY_SNAPSHOT: &str = "sm:snapshot";
+pub(crate) const KEY_SNAPSHOT: &str = "sm:snapshot";
 
 #[derive(Default, Clone, Serialize, Deserialize)]
 struct StateMachineData {
@@ -93,6 +93,23 @@ fn persist_snapshot<S: Storage>(
     db.put(KEY_SNAPSHOT, &bytes).map_err(swrite)
 }
 
+/// The highest log index covered by the persisted snapshot, if any.
+///
+/// This is the "applied base" the log must be contiguous with after a restart:
+/// with a snapshot at index `S`, a replayable log starts at `S + 1`. Used by the
+/// startup recovery step to detect a log whose prefix was lost.
+pub(crate) fn snapshot_last_index<S: Storage>(
+    db: &S,
+) -> Result<Option<u64>, StorageError<NodeId>> {
+    match db.get(KEY_SNAPSHOT).map_err(sread)? {
+        Some(bytes) => {
+            let stored: StoredSnapshot = dec(&bytes)?;
+            Ok(stored.meta.last_log_id.map(|l| l.index))
+        }
+        None => Ok(None),
+    }
+}
+
 impl<S: Storage> RaftStateMachine<TypeConfig> for StateMachineStore<S> {
     type SnapshotBuilder = SnapshotBuilder<S>;
 
@@ -152,9 +169,6 @@ impl<S: Storage> RaftStateMachine<TypeConfig> for StateMachineStore<S> {
             data: bytes,
         };
         persist_snapshot(self.db.as_ref(), &stored)?;
-        if let Some(last) = meta.last_log_id {
-            super::log_store::mark_purged(self.db.as_ref(), &last)?;
-        }
         self.inner.lock().unwrap().data = data;
         Ok(())
     }
@@ -172,78 +186,6 @@ impl<S: Storage> RaftStateMachine<TypeConfig> for StateMachineStore<S> {
             }
             None => Ok(None),
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use openraft::storage::{RaftLogStorage, RaftStateMachine};
-    use openraft::{CommittedLeaderId, LogId};
-
-    fn log_id(term: u64, index: u64) -> LogId<NodeId> {
-        LogId::new(CommittedLeaderId::new(term, 1), index)
-    }
-
-    #[tokio::test]
-    async fn install_snapshot_advances_the_purged_pointer() {
-        let db = Arc::new(RedbStore::in_memory().unwrap());
-        let mut sm = StateMachineStore::new(db.clone()).unwrap();
-        let mut log = super::super::LogStore::new(db.clone());
-
-        let last = log_id(3615, 194078);
-        let bytes = enc(&StateMachineData::default()).unwrap();
-        let meta = SnapshotMeta {
-            last_log_id: Some(last),
-            last_membership: StoredMembership::default(),
-            snapshot_id: "snap-1".to_string(),
-        };
-
-        sm.install_snapshot(&meta, Box::new(Cursor::new(bytes)))
-            .await
-            .unwrap();
-
-        let state = log.get_log_state().await.unwrap();
-        assert_eq!(
-            state.last_purged_log_id,
-            Some(last),
-            "a snapshot install on a wiped node must advance the log's purged pointer"
-        );
-        assert_eq!(
-            state.last_log_id,
-            Some(last),
-            "with no log entries yet, last_log_id tracks the snapshot boundary"
-        );
-    }
-
-    #[tokio::test]
-    async fn purge_pointer_never_moves_backwards() {
-        let db = Arc::new(RedbStore::in_memory().unwrap());
-        let mut sm = StateMachineStore::new(db.clone()).unwrap();
-        let mut log = super::super::LogStore::new(db.clone());
-
-        let newer = log_id(3615, 200000);
-        let meta_new = SnapshotMeta {
-            last_log_id: Some(newer),
-            last_membership: StoredMembership::default(),
-            snapshot_id: "snap-new".to_string(),
-        };
-        sm.install_snapshot(&meta_new, Box::new(Cursor::new(enc(&StateMachineData::default()).unwrap())))
-            .await
-            .unwrap();
-
-        let older = log_id(3615, 194078);
-        let meta_old = SnapshotMeta {
-            last_log_id: Some(older),
-            last_membership: StoredMembership::default(),
-            snapshot_id: "snap-old".to_string(),
-        };
-        sm.install_snapshot(&meta_old, Box::new(Cursor::new(enc(&StateMachineData::default()).unwrap())))
-            .await
-            .unwrap();
-
-        let state = log.get_log_state().await.unwrap();
-        assert_eq!(state.last_purged_log_id, Some(newer), "a stale snapshot must not lower the purged pointer");
     }
 }
 

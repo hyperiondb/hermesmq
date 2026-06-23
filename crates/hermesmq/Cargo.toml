@@ -11,4 +11,4 @@ categories.workspace = true
 description = "A simple, Raft-replicated message queue with priority, rate limiting, and push/pull delivery"
 
 [dependencies]
-hermesmq-core = { path = "../hermesmq-core", version = "=0.6.2" }
+hermesmq-core = { path = "../hermesmq-core", version = "=0.6.3" }

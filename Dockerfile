@@ -3,7 +3,7 @@ FROM rust:slim-bookworm AS builder
 WORKDIR /build
 COPY . .
 RUN cargo build --release -p hermesmqd
-
+ 
 FROM debian:bookworm-slim
 
 RUN apt-get update \

@@ -3,8 +3,8 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use hermesmq_core::engine::{
-    add_learner, build_raft, build_raft_partitionable, initialize_cluster, serve_peer, set_voters,
-    PartitionControl,
+    add_learner, build_raft, build_raft_partitionable, build_raft_tuned, initialize_cluster,
+    serve_peer, set_voters, PartitionControl,
 };
 use hermesmq_core::{AppRequest, AppResponse, ContentType, GroupId, HermesRaft, Priority, RedbStore, TopicId};
 use tokio::net::TcpListener;
@@ -319,6 +319,142 @@ async fn wiped_node_recovers_via_snapshot_and_survives_restart() {
     assert!(
         reached >= target2,
         "restarted node stuck: applied={reached}, snapshot={snap:?}, snap_idx={snap_idx}, target2={target2}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn wiped_node_recovers_through_snapshot_overlap() {
+    const SNAP_LOGS: u64 = 4;
+    const KEEP: u64 = 0;
+
+    async fn spawn_tuned(id: u64, snap: u64, keep: u64) -> (HermesRaft, String) {
+        let db = Arc::new(RedbStore::in_memory().unwrap());
+        let (raft, _sm) = build_raft_tuned(id, db, snap, keep, 1024 * 1024).await.unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        tokio::spawn(serve_peer(raft.clone(), listener));
+        (raft, addr)
+    }
+
+    let (r1, a1) = spawn_tuned(1, SNAP_LOGS, KEEP).await;
+    let (r2, a2) = spawn_tuned(2, SNAP_LOGS, KEEP).await;
+    initialize_cluster(&r1, &[(1, a1), (2, a2)]).await.unwrap();
+    let voters = [(1u64, &r1), (2, &r2)];
+    let leader_id = wait_for_leader(&voters).await;
+    let leader = pick(&voters, leader_id);
+
+    leader
+        .client_write(AppRequest::CreateTopic { topic: TopicId::from("t") })
+        .await
+        .unwrap();
+    for _ in 0..40 {
+        leader.client_write(produce_req("x")).await.unwrap();
+    }
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    let db3 = Arc::new(RedbStore::in_memory().unwrap());
+    let (r3, _sm3) = build_raft_tuned(3, db3, SNAP_LOGS, KEEP, 1024 * 1024).await.unwrap();
+    let l3 = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let a3 = l3.local_addr().unwrap().to_string();
+    tokio::spawn(serve_peer(r3.clone(), l3));
+    add_learner(leader, 3, a3).await.unwrap();
+
+    for _ in 0..40 {
+        leader.client_write(produce_req("y")).await.unwrap();
+    }
+    let target = last_applied_index(leader);
+
+    for _ in 0..200 {
+        if last_applied_index(&r3) >= target {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let reached = last_applied_index(&r3);
+    assert!(
+        reached >= target,
+        "wiped node stuck recovering through snapshot overlap: applied={reached}, target={target}"
+    );
+}
+
+/// A wiped node must catch up via a snapshot that spans MANY chunks.
+///
+/// With openraft's 3 MiB default `snapshot_max_chunk_size`, every snapshot in
+/// these tests fit in a single chunk, so the multi-chunk transport path — and
+/// the per-chunk `install_snapshot_timeout` — were never exercised. In
+/// production a multi-megabyte snapshot shipped as one chunk with the 200ms
+/// default timeout could not round-trip on the overlay network, so openraft
+/// restarted the transfer from offset 0 forever and the node never recovered.
+/// Here we force a small chunk size so the snapshot is split into many chunks
+/// and assert the fresh node fully installs it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn wiped_node_recovers_via_multichunk_snapshot() {
+    const SNAP_LOGS: u64 = 4;
+    const KEEP: u64 = 0;
+    const CHUNK: u64 = 8 * 1024; // 8 KiB — far smaller than the snapshot below.
+
+    async fn spawn_tuned_chunked(id: u64, chunk: u64) -> (HermesRaft, String) {
+        let db = Arc::new(RedbStore::in_memory().unwrap());
+        let (raft, _sm) = build_raft_tuned(id, db, SNAP_LOGS, KEEP, chunk).await.unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        tokio::spawn(serve_peer(raft.clone(), listener));
+        (raft, addr)
+    }
+
+    fn produce_big(n: usize) -> AppRequest {
+        AppRequest::Produce {
+            topic: TopicId::from("t"),
+            priority: Priority::default(),
+            content_type: ContentType::Raw,
+            payload: bytes::Bytes::from(vec![(n & 0xff) as u8; 4096]), // 4 KiB each
+            producer_id: String::new(),
+            seq: 0,
+            ts_ms: 0,
+        }
+    }
+
+    let (r1, a1) = spawn_tuned_chunked(1, CHUNK).await;
+    let (r2, a2) = spawn_tuned_chunked(2, CHUNK).await;
+    initialize_cluster(&r1, &[(1, a1), (2, a2)]).await.unwrap();
+    let voters = [(1u64, &r1), (2, &r2)];
+    let leader_id = wait_for_leader(&voters).await;
+    let leader = pick(&voters, leader_id);
+
+    leader
+        .client_write(AppRequest::CreateTopic { topic: TopicId::from("t") })
+        .await
+        .unwrap();
+    // ~50 * 4 KiB of retained payload >> 8 KiB chunk -> snapshot spans many chunks.
+    for i in 0..50 {
+        leader.client_write(produce_big(i)).await.unwrap();
+    }
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    // Fresh node: its log is empty and the leader purged its own, so the only way
+    // to catch up is a full, multi-chunk snapshot install.
+    let db3 = Arc::new(RedbStore::in_memory().unwrap());
+    let (r3, _sm3) = build_raft_tuned(3, db3, SNAP_LOGS, KEEP, CHUNK).await.unwrap();
+    let l3 = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let a3 = l3.local_addr().unwrap().to_string();
+    tokio::spawn(serve_peer(r3.clone(), l3));
+    add_learner(leader, 3, a3).await.unwrap();
+
+    for i in 50..70 {
+        leader.client_write(produce_big(i)).await.unwrap();
+    }
+    let target = last_applied_index(leader);
+
+    for _ in 0..200 {
+        if last_applied_index(&r3) >= target {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let reached = last_applied_index(&r3);
+    assert!(
+        reached >= target,
+        "node stuck installing a multi-chunk snapshot: applied={reached}, target={target}"
     );
 }
 
