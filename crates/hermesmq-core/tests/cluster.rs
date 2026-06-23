@@ -458,6 +458,144 @@ async fn wiped_node_recovers_via_multichunk_snapshot() {
     );
 }
 
+/// PRODUCTION scenario: an EXISTING VOTER is wiped to an empty volume and
+/// restarts under the SAME node id, while the leader has already purged its log
+/// prefix. Unlike every other "wiped node" test, the node is NOT re-added with
+/// `add_learner` — it is already in committed membership, so recovery is driven
+/// entirely by the leader replicating to the reused address. This is the path
+/// that crash-loops in production with
+/// `LogIndexNotFound { want: 0, got: Some(<purged index>) }`.
+static SAW_REVERSION_PANIC: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn wiped_voter_rejoins_without_readd() {
+    use std::path::Path;
+    use std::sync::atomic::Ordering;
+
+    // Without `loosen-follower-log-revert`, openraft's leader trips a
+    // `debug_assert!` ("follower log reversion is not allowed") the moment a
+    // previously replicated voter returns wiped. tokio isolates that panic to a
+    // worker thread, so the test would otherwise report `ok`. Catch it via the
+    // panic hook and fail explicitly — this is the regression guard.
+    SAW_REVERSION_PANIC.store(false, Ordering::SeqCst);
+    let prev_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        if format!("{info}").contains("log reversion") {
+            SAW_REVERSION_PANIC.store(true, Ordering::SeqCst);
+        }
+        prev_hook(info);
+    }));
+
+    async fn open_node(
+        id: u64,
+        file: &Path,
+        addr: Option<&str>,
+    ) -> (HermesRaft, String, tokio::task::JoinHandle<()>) {
+        let db = Arc::new(RedbStore::open(file).unwrap());
+        let (raft, _sm) = build_raft(id, db).await.unwrap();
+        let listener = match addr {
+            Some(a) => {
+                let mut bound = None;
+                for _ in 0..100 {
+                    if let Ok(l) = TcpListener::bind(a).await {
+                        bound = Some(l);
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+                bound.expect("port frees up after the dead node releases its listener")
+            }
+            None => TcpListener::bind("127.0.0.1:0").await.unwrap(),
+        };
+        let real_addr = listener.local_addr().unwrap().to_string();
+        let serve = tokio::spawn(serve_peer(raft.clone(), listener));
+        (raft, real_addr, serve)
+    }
+
+    let nanos = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+    let base: PathBuf = std::env::temp_dir().join(format!("hermesmq-rejoin-{nanos}"));
+    let file_of = |id: u64| base.join(format!("n{id}")).join("hermesmq.redb");
+    for id in [1u64, 2, 3] {
+        std::fs::create_dir_all(file_of(id).parent().unwrap()).unwrap();
+    }
+
+    let (r1, a1, s1) = open_node(1, &file_of(1), None).await;
+    let (r2, a2, s2) = open_node(2, &file_of(2), None).await;
+    let (r3, a3, s3) = open_node(3, &file_of(3), None).await;
+
+    initialize_cluster(&r1, &[(1, a1.clone()), (2, a2.clone()), (3, a3.clone())])
+        .await
+        .unwrap();
+
+    let all = [(1u64, &r1), (2, &r2), (3, &r3)];
+    let leader_id = wait_for_leader(&all).await;
+    let leader = pick(&all, leader_id);
+
+    // Wipe a follower (prefer node 2, matching prod) so the cluster keeps quorum.
+    let victim_id = if leader_id != 2 { 2 } else { 1 };
+    let victim_addr = match victim_id {
+        1 => a1.clone(),
+        2 => a2.clone(),
+        _ => a3.clone(),
+    };
+
+    leader
+        .client_write(AppRequest::CreateTopic { topic: TopicId::from("t") })
+        .await
+        .unwrap();
+    for _ in 0..5 {
+        leader.client_write(produce_req("snap")).await.unwrap();
+    }
+    leader.trigger().snapshot().await.unwrap();
+    let snap_idx = snapshot_index(leader).await;
+    for _ in 0..5 {
+        leader.client_write(produce_req("tail")).await.unwrap();
+    }
+    // Purge the leader's prefix so a blank follower can ONLY recover via snapshot.
+    leader.trigger().purge_log(snap_idx).await.unwrap();
+
+    // --- WIPE: shut the voter down, delete its volume, restart empty, same id+addr ---
+    pick(&all, victim_id).shutdown().await.unwrap();
+    for (id, s) in [(1u64, s1), (2, s2), (3, s3)] {
+        if id == victim_id {
+            s.abort();
+        }
+    }
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    std::fs::remove_dir_all(file_of(victim_id).parent().unwrap()).unwrap();
+    std::fs::create_dir_all(file_of(victim_id).parent().unwrap()).unwrap();
+
+    // NOTE: no add_learner — the node is already a committed voter.
+    let (r_victim, _va, _vs) = open_node(victim_id, &file_of(victim_id), Some(&victim_addr)).await;
+
+    for _ in 0..3 {
+        leader.client_write(produce_req("after")).await.unwrap();
+    }
+    let target = last_applied_index(leader);
+
+    let mut reached = 0;
+    for _ in 0..200 {
+        reached = last_applied_index(&r_victim);
+        if reached >= target {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let snap = r_victim.metrics().borrow().snapshot.as_ref().map(|l| l.index);
+    r_victim.shutdown().await.ok();
+    let _ = std::fs::remove_dir_all(&base);
+    assert!(
+        reached >= target,
+        "wiped voter failed to rejoin: applied={reached}, target={target}, \
+         snap_idx={snap_idx}, victim_snapshot={snap:?}"
+    );
+    assert!(
+        !SAW_REVERSION_PANIC.load(Ordering::SeqCst),
+        "leader hit openraft's follower-log-reversion assertion — \
+         loosen-follower-log-revert is not effective"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn cluster_minority_cannot_commit() {
     let (r1, a1) = spawn_node(1).await;

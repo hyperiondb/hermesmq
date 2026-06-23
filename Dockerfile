@@ -1,9 +1,17 @@
-FROM rust:slim-bookworm AS builder
-
+FROM lukemathwalker/cargo-chef:latest-rust-slim-bookworm AS chef
 WORKDIR /build
+
+FROM chef AS planner
+COPY . .
+RUN cargo chef prepare --recipe-path recipe.json
+
+FROM chef AS builder
+COPY --from=planner /build/recipe.json recipe.json
+# Build and cache dependencies — this layer is only invalidated when recipe.json changes.
+RUN cargo chef cook --release -p hermesmqd --recipe-path recipe.json
 COPY . .
 RUN cargo build --release -p hermesmqd
- 
+
 FROM debian:bookworm-slim
 
 RUN apt-get update \
