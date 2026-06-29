@@ -23,7 +23,7 @@ Status: **in production**
 
 ## Highly subjective performance (0.2.0)
 
-...testing on local machine, w/o network, etc. bottlenecks
+...testing on local machine, (i5, 32GB RAM) w/o network, etc. bottlenecks
 
 ![HermesMQ performance](https://github.com/hyperiondb/hermesmq/blob/main/performance.png?raw=true)
 
@@ -340,6 +340,15 @@ catastrophic regressions: queue state-machine ops, sequential / concurrent / pip
 against a single fsync-backed node, poll/ack drain, subscribe push, produce-to-delivery push tail
 latency (p50/p99/p99.9), and 3-node replicated writes.
 (Alias for `cargo test -p hermesmq-core --release --test perf -- --ignored --nocapture --test-threads=1`.)
+
+### Fuzzing
+
+Nightly + [cargo-fuzz](https://github.com/rust-fuzz/cargo-fuzz). Targets decode untrusted protobuf wire bytes and are bounded so they exit:
+
+```sh
+cargo +nightly fuzz run request_decode  -- -max_total_time=60   # client Request (protobuf, server-side)
+cargo +nightly fuzz run response_decode -- -max_total_time=60   # server Response (protobuf, client-side)
+```
 
 ## Caveats
 

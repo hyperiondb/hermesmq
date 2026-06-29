@@ -1,0 +1,36 @@
+[package]
+name = "hermesmq-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+prost = "0.13"
+bytes = "1"
+
+hermesmq-proto = { path = "../crates/hermesmq-proto" }
+
+# Detached from the parent workspace so `cargo build/test` and the stable-pinned
+# CI never try to compile this nightly-only crate.
+[workspace]
+
+[profile.release]
+debug = 1
+
+[[bin]]
+name = "request_decode"
+path = "fuzz_targets/request_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "response_decode"
+path = "fuzz_targets/response_decode.rs"
+test = false
+doc = false
+bench = false

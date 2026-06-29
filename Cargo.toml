@@ -3,7 +3,7 @@ resolver = "2"
 members = ["crates/hermesmq", "crates/hermesmq-core", "crates/hermesmq-proto", "crates/hermesmqd"]
 
 [workspace.package]
-version = "0.6.4"
+version = "0.6.5"
 edition = "2021"
 license = "AGPL-3.0-only"
 authors = ["Tadas Talaikis <info@nordlet.com>"]
