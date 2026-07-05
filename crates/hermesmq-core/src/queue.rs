@@ -1,4 +1,5 @@
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::cmp::Reverse;
+use std::collections::{BTreeMap, BTreeSet, BinaryHeap, VecDeque};
 
 use serde::{Deserialize, Serialize};
 
@@ -9,6 +10,7 @@ const DEDUP_CAPACITY: usize = 100_000;
 const RESERVED_DEN: u64 = 4;
 const DEFAULT_RETAIN_MAX_MESSAGES: u64 = 1_000_000;
 const GROUP_GC_THRESHOLD: usize = 1024;
+const GROUP_IDLE_EXPIRE_MS: u64 = 7 * 24 * 60 * 60 * 1000;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct Lease {
@@ -23,6 +25,7 @@ struct GroupState {
     in_flight: BTreeMap<LeaseId, Lease>,
     leased_offsets: BTreeMap<Offset, u64>,
     poll_count: u64,
+    last_active_ms: u64,
 }
 
 impl GroupState {
@@ -145,6 +148,30 @@ impl Queue {
                     &mut next_lease,
                 );
                 self.next_lease_id = next_lease;
+                AppResponse::Polled { items }
+            }
+            AppRequest::PollAuto {
+                topic,
+                group,
+                max,
+                visibility_timeout_ms,
+                ts_ms,
+            } => {
+                let mut next_lease = self.next_lease_id;
+                let items = poll(
+                    &mut self.topics,
+                    &topic.0,
+                    &group.0,
+                    max,
+                    visibility_timeout_ms,
+                    ts_ms,
+                    &mut next_lease,
+                );
+                self.next_lease_id = next_lease;
+                for d in &items {
+                    ack(&mut self.topics, &topic.0, &group.0, d.lease_id);
+                }
+                reclaim_topic(&mut self.topics, &topic.0);
                 AppResponse::Polled { items }
             }
             AppRequest::Ack {
@@ -311,25 +338,22 @@ fn poll(
     let Some(t) = topics.get_mut(topic) else {
         return Vec::new();
     };
+    if sweep_idle_groups(t, ts_ms) {
+        reclaim(t);
+    }
     let first = t.messages.keys().next().copied().unwrap_or(t.next_offset);
     let g = t.groups.entry(group.to_string()).or_insert_with(|| GroupState {
         ack_watermark: first,
         ..GroupState::default()
     });
     g.expire(ts_ms);
+    g.last_active_ms = g.last_active_ms.max(ts_ms);
 
     let max = max as usize;
-    let mut candidates: Vec<(Priority, Offset)> = Vec::new();
-    for (offset, message) in t.messages.range(g.ack_watermark..) {
-        if !g.acked_above.contains(offset) && !g.leased_offsets.contains_key(offset) {
-            candidates.push((message.priority, *offset));
-        }
-    }
-
     let poll_count = g.poll_count;
     g.poll_count += 1;
 
-    if candidates.is_empty() || max == 0 {
+    if max == 0 {
         return Vec::new();
     }
 
@@ -338,34 +362,38 @@ fn poll(
     let reserved = (base + bonus).min(max);
     let priority_slots = max - reserved;
 
-    let by_offset = candidates.clone();
-    let mut by_priority = candidates;
-    by_priority.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+    let mut earliest: Vec<(Priority, Offset)> = Vec::new();
+    let mut top: BinaryHeap<Reverse<(Priority, Reverse<Offset>)>> = BinaryHeap::new();
+    for (offset, message) in t.messages.range(g.ack_watermark..) {
+        if g.acked_above.contains(offset) || g.leased_offsets.contains_key(offset) {
+            continue;
+        }
+        if earliest.len() < max {
+            earliest.push((message.priority, *offset));
+        } else if priority_slots == 0 {
+            break;
+        }
+        if priority_slots > 0 {
+            top.push(Reverse((message.priority, Reverse(*offset))));
+            if top.len() > priority_slots {
+                top.pop();
+            }
+        }
+    }
 
     let mut chosen_set: BTreeSet<Offset> = BTreeSet::new();
     let mut chosen: Vec<(Priority, Offset)> = Vec::new();
-    for item in by_priority.iter() {
-        if chosen.len() >= priority_slots {
-            break;
-        }
-        if chosen_set.insert(item.1) {
-            chosen.push(*item);
+    for Reverse((priority, Reverse(offset))) in top {
+        if chosen_set.insert(offset) {
+            chosen.push((priority, offset));
         }
     }
-    for item in by_offset.iter() {
+    for item in earliest {
         if chosen.len() >= max {
             break;
         }
         if chosen_set.insert(item.1) {
-            chosen.push(*item);
-        }
-    }
-    for item in by_priority.iter() {
-        if chosen.len() >= max {
-            break;
-        }
-        if chosen_set.insert(item.1) {
-            chosen.push(*item);
+            chosen.push(item);
         }
     }
     chosen.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
@@ -475,6 +503,16 @@ fn reclaim(t: &mut TopicState) {
     gc_idle_groups(t);
 }
 
+fn sweep_idle_groups(t: &mut TopicState, now_ms: u64) -> bool {
+    let before = t.groups.len();
+    t.groups.retain(|_, g| {
+        g.last_active_ms == 0
+            || now_ms.saturating_sub(g.last_active_ms) <= GROUP_IDLE_EXPIRE_MS
+            || g.in_flight.values().any(|l| l.deadline_ms > now_ms)
+    });
+    t.groups.len() != before
+}
+
 fn gc_idle_groups(t: &mut TopicState) {
     if t.groups.len() <= GROUP_GC_THRESHOLD || !t.messages.is_empty() {
         return;
@@ -500,6 +538,76 @@ fn commit(topics: &mut BTreeMap<String, TopicState>, topic: &str, group: &str, o
     if let Some(t) = topics.get_mut(topic) {
         let g = group_entry(t, group);
         g.advance_watermark(offset);
+    }
+}
+
+pub(crate) mod compat {
+    use super::*;
+
+    #[derive(Deserialize)]
+    pub(crate) struct QueueV0 {
+        topics: BTreeMap<String, TopicStateV0>,
+        next_lease_id: LeaseId,
+    }
+
+    #[derive(Deserialize)]
+    struct TopicStateV0 {
+        next_offset: Offset,
+        messages: BTreeMap<Offset, Message>,
+        dedup: BTreeMap<(String, u64), Offset>,
+        dedup_order: VecDeque<(String, u64)>,
+        groups: BTreeMap<String, GroupStateV0>,
+        rate_milli_per_sec: u64,
+        burst: u32,
+        retain_max_messages: u64,
+        retain_max_age_ms: u64,
+    }
+
+    #[derive(Deserialize)]
+    struct GroupStateV0 {
+        ack_watermark: Offset,
+        acked_above: BTreeSet<Offset>,
+        in_flight: BTreeMap<LeaseId, Lease>,
+        leased_offsets: BTreeMap<Offset, u64>,
+        poll_count: u64,
+    }
+
+    impl From<GroupStateV0> for GroupState {
+        fn from(g: GroupStateV0) -> Self {
+            GroupState {
+                ack_watermark: g.ack_watermark,
+                acked_above: g.acked_above,
+                in_flight: g.in_flight,
+                leased_offsets: g.leased_offsets,
+                poll_count: g.poll_count,
+                last_active_ms: 0,
+            }
+        }
+    }
+
+    impl From<TopicStateV0> for TopicState {
+        fn from(t: TopicStateV0) -> Self {
+            TopicState {
+                next_offset: t.next_offset,
+                messages: t.messages,
+                dedup: t.dedup,
+                dedup_order: t.dedup_order,
+                groups: t.groups.into_iter().map(|(k, g)| (k, g.into())).collect(),
+                rate_milli_per_sec: t.rate_milli_per_sec,
+                burst: t.burst,
+                retain_max_messages: t.retain_max_messages,
+                retain_max_age_ms: t.retain_max_age_ms,
+            }
+        }
+    }
+
+    impl From<QueueV0> for Queue {
+        fn from(q: QueueV0) -> Self {
+            Queue {
+                topics: q.topics.into_iter().map(|(k, t)| (k, t.into())).collect(),
+                next_lease_id: q.next_lease_id,
+            }
+        }
     }
 }
 
@@ -980,6 +1088,152 @@ mod tests {
             .map(|(_, o)| o)
             .collect();
         assert_eq!(offsets, vec![0, 1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn poll_auto_acks_in_one_apply() {
+        let mut q = Queue::default();
+        for i in 0..3 {
+            produce(&mut q, "t", 0, &[i], "", 0);
+        }
+        let resp = q.apply(AppRequest::PollAuto {
+            topic: TopicId::from("t"),
+            group: GroupId::from("g"),
+            max: 10,
+            visibility_timeout_ms: 1000,
+            ts_ms: 0,
+        });
+        let items = match resp {
+            AppResponse::Polled { items } => items,
+            other => panic!("expected Polled, got {other:?}"),
+        };
+        assert_eq!(items.len(), 3);
+        assert_eq!(q.metrics().in_flight, 0, "auto-acked leases must not stay in flight");
+        assert_eq!(q.metrics().messages, 0, "acked messages are reclaimed in the same apply");
+        let again = poll_offsets(&mut q, "t", "g", 10, 1000, 5000);
+        assert!(again.is_empty(), "auto-acked messages must not be redelivered");
+    }
+
+    #[test]
+    fn idle_group_expires_and_unpins_memory() {
+        let mut q = Queue::default();
+        for i in 0..3 {
+            produce(&mut q, "t", 0, &[i], "", 0);
+        }
+        poll_offsets(&mut q, "t", "dead", 1, 10, 1_000);
+        let leased = poll_offsets(&mut q, "t", "live", 10, 1000, GROUP_IDLE_EXPIRE_MS);
+        assert_eq!(leased.len(), 3);
+        for (lease_id, _) in leased {
+            q.apply(AppRequest::Ack {
+                topic: TopicId::from("t"),
+                group: GroupId::from("live"),
+                lease_id,
+            });
+        }
+        assert_eq!(q.metrics().messages, 3, "the dead group still pins the messages");
+        poll_offsets(&mut q, "t", "live", 10, 1000, GROUP_IDLE_EXPIRE_MS + 1_002);
+        let groups = &q.topics["t"].groups;
+        assert!(!groups.contains_key("dead"), "an idle group must expire after the TTL");
+        assert!(groups.contains_key("live"), "an active group must survive the sweep");
+        assert_eq!(q.metrics().messages, 0, "expiring the idle group frees the messages");
+    }
+
+    #[test]
+    fn idle_group_with_unexpired_lease_survives() {
+        let mut q = Queue::default();
+        produce(&mut q, "t", 0, b"a", "", 0);
+        poll_offsets(&mut q, "t", "dead", 1, GROUP_IDLE_EXPIRE_MS * 2, 1_000);
+        poll_offsets(&mut q, "t", "live", 10, 1000, GROUP_IDLE_EXPIRE_MS + 2_000);
+        assert!(
+            q.topics["t"].groups.contains_key("dead"),
+            "a group holding an unexpired lease must not be swept"
+        );
+    }
+
+    #[test]
+    fn group_without_activity_timestamp_never_expires() {
+        let mut q = Queue::default();
+        produce(&mut q, "t", 0, b"a", "", 0);
+        q.apply(AppRequest::CommitOffset {
+            topic: TopicId::from("t"),
+            group: GroupId::from("commit-only"),
+            offset: 0,
+        });
+        poll_offsets(&mut q, "t", "live", 10, 1000, GROUP_IDLE_EXPIRE_MS * 10);
+        assert!(
+            q.topics["t"].groups.contains_key("commit-only"),
+            "a group with no recorded poll activity (legacy or commit-created) is immune"
+        );
+    }
+
+    fn reference_selection(
+        candidates: &[(Priority, Offset)],
+        max: usize,
+        poll_count: u64,
+    ) -> Vec<Offset> {
+        if candidates.is_empty() || max == 0 {
+            return Vec::new();
+        }
+        let base = max / RESERVED_DEN as usize;
+        let bonus = usize::from((poll_count + 1) % RESERVED_DEN == 0);
+        let reserved = (base + bonus).min(max);
+        let priority_slots = max - reserved;
+        let by_offset = candidates.to_vec();
+        let mut by_priority = candidates.to_vec();
+        by_priority.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+        let mut chosen_set: BTreeSet<Offset> = BTreeSet::new();
+        let mut chosen: Vec<(Priority, Offset)> = Vec::new();
+        for item in by_priority.iter() {
+            if chosen.len() >= priority_slots {
+                break;
+            }
+            if chosen_set.insert(item.1) {
+                chosen.push(*item);
+            }
+        }
+        for item in by_offset.iter() {
+            if chosen.len() >= max {
+                break;
+            }
+            if chosen_set.insert(item.1) {
+                chosen.push(*item);
+            }
+        }
+        for item in by_priority.iter() {
+            if chosen.len() >= max {
+                break;
+            }
+            if chosen_set.insert(item.1) {
+                chosen.push(*item);
+            }
+        }
+        chosen.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+        chosen.into_iter().map(|(_, o)| o).collect()
+    }
+
+    proptest! {
+        #[test]
+        fn bounded_selection_matches_reference(
+            priorities in prop::collection::vec(0u8..8, 1..120),
+            max in 1u32..20,
+            rounds in 1usize..6,
+        ) {
+            let mut q = Queue::default();
+            let mut remaining: Vec<(Priority, Offset)> = Vec::new();
+            for (i, p) in priorities.iter().enumerate() {
+                produce(&mut q, "t", *p, &[*p], "", 0);
+                remaining.push((Priority(*p), i as Offset));
+            }
+            for round in 0..rounds {
+                let expected = reference_selection(&remaining, max as usize, round as u64);
+                let got: Vec<Offset> = poll_offsets(&mut q, "t", "g", max, 1_000_000, round as u64)
+                    .into_iter()
+                    .map(|(_, o)| o)
+                    .collect();
+                prop_assert_eq!(&got, &expected, "round {} diverged from the old algorithm", round);
+                remaining.retain(|(_, o)| !expected.contains(o));
+            }
+        }
     }
 
     proptest! {

@@ -33,6 +33,21 @@ struct Cli {
     metrics_enabled: bool,
 }
 
+#[cfg(unix)]
+async fn shutdown_signal() -> std::io::Result<()> {
+    use tokio::signal::unix::{signal, SignalKind};
+    let mut term = signal(SignalKind::terminate())?;
+    tokio::select! {
+        r = tokio::signal::ctrl_c() => r,
+        _ = term.recv() => Ok(()),
+    }
+}
+
+#[cfg(not(unix))]
+async fn shutdown_signal() -> std::io::Result<()> {
+    tokio::signal::ctrl_c().await
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
@@ -69,7 +84,7 @@ async fn main() -> anyhow::Result<()> {
     tokio::spawn(serve_clients(raft.clone(), sm.clone(), client_listener));
     tokio::spawn(serve_http(raft.clone(), sm, metrics_listener, cli.metrics_enabled));
 
-    tokio::signal::ctrl_c().await?;
+    shutdown_signal().await?;
     tracing::info!("shutdown signal received; stopping raft node");
     raft.shutdown().await?;
     Ok(())

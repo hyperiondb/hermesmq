@@ -67,6 +67,13 @@ pub enum AppRequest {
         group: GroupId,
         lease_ids: Vec<LeaseId>,
     },
+    PollAuto {
+        topic: TopicId,
+        group: GroupId,
+        max: u32,
+        visibility_timeout_ms: u64,
+        ts_ms: u64,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

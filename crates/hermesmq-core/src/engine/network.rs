@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 use tokio::net::{TcpListener, TcpStream};
 
 use super::HermesRaft;
-use crate::frame::{read_frame, to_io, write_frame};
+use crate::frame::{read_frame, to_io, write_frame, MAX_PEER_FRAME};
 use crate::raft::TypeConfig;
 use crate::types::NodeId;
 
@@ -50,7 +50,7 @@ pub async fn serve_peer(raft: HermesRaft, listener: TcpListener) {
 
 async fn handle_conn(raft: HermesRaft, mut stream: TcpStream) -> io::Result<()> {
     loop {
-        let req_bytes = read_frame(&mut stream).await?;
+        let req_bytes = read_frame(&mut stream, MAX_PEER_FRAME).await?;
         let req: PeerRequest = postcard::from_bytes(&req_bytes).map_err(to_io)?;
         let resp = match req {
             PeerRequest::AppendEntries(r) => PeerResponse::AppendEntries(raft.append_entries(r).await),
@@ -126,7 +126,7 @@ impl PeerConnection {
         write_frame(&mut stream, &bytes)
             .await
             .map_err(|e| Unreachable::new(&e))?;
-        let resp_bytes = read_frame(&mut stream)
+        let resp_bytes = read_frame(&mut stream, MAX_PEER_FRAME)
             .await
             .map_err(|e| Unreachable::new(&e))?;
         let resp = postcard::from_bytes(&resp_bytes).map_err(|e| Unreachable::new(&to_io(e)))?;

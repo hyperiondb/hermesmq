@@ -3,7 +3,8 @@ use std::io;
 use bytes::{Bytes, BytesMut};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-pub(crate) const MAX_FRAME: usize = 64 * 1024 * 1024;
+pub(crate) const MAX_CLIENT_FRAME: usize = 2 * 1024 * 1024;
+pub(crate) const MAX_PEER_FRAME: usize = 64 * 1024 * 1024;
 
 pub(crate) fn to_io<E: std::fmt::Display>(e: E) -> io::Error {
     io::Error::other(e.to_string())
@@ -16,11 +17,11 @@ pub(crate) async fn write_frame<W: AsyncWriteExt + Unpin>(w: &mut W, bytes: &[u8
     Ok(())
 }
 
-pub(crate) async fn read_frame<R: AsyncReadExt + Unpin>(r: &mut R) -> io::Result<Bytes> {
+pub(crate) async fn read_frame<R: AsyncReadExt + Unpin>(r: &mut R, max_frame: usize) -> io::Result<Bytes> {
     let mut len = [0u8; 4];
     r.read_exact(&mut len).await?;
     let n = u32::from_be_bytes(len) as usize;
-    if n > MAX_FRAME {
+    if n > max_frame {
         return Err(io::Error::new(io::ErrorKind::InvalidData, "frame exceeds maximum size"));
     }
     let mut buf = BytesMut::zeroed(n);

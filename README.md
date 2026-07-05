@@ -261,7 +261,8 @@ Length-prefixed frames (`u32` big-endian length + Protobuf body). One `Request`/
 frames and reads `ack`/`nack` frames back on the same socket. Inter-node Raft RPC uses the same
 framing with postcard-encoded openraft messages (one persistent connection per peer).
 
-Server-side limits and defaults (applied when a field is `0`): produce payloads are capped at
+Server-side limits and defaults (applied when a field is `0`): client frames are capped at
+**2 MiB** and peer-RPC frames at 64 MiB, produce payloads are capped at
 **1 MiB** (`payload_too_large` otherwise), poll `max` defaults to 16 (capped at 1024),
 `visibility_timeout_ms` defaults to 30 000, `wait_ms` is capped at 300 000, and `priority` is
 clamped to 0–7. `not_leader` errors include the current leader's peer address in `leader_addr`
@@ -276,7 +277,9 @@ pending responses to drain, then takes over the connection as before.
 
 Concurrent produces (pipelined or across connections) are **group-committed**: the node coalesces
 them into a single replicated log entry and one fsync, so produce throughput scales with the
-number of in-flight requests instead of paying a full Raft round per message. A produce only ever
+number of in-flight requests instead of paying a full Raft round per message. Up to 4 batches are
+replicated concurrently, so a sustained burst pipelines Raft rounds instead of serializing them
+(batches may commit out of order — per-produce offsets are unaffected). A produce only ever
 returns after its batch is durable and replicated — semantics are unchanged.
 
 ## Observability
@@ -358,6 +361,9 @@ cargo +nightly fuzz run response_decode -- -max_total_time=60   # server Respons
   automatically (consumption-based), so a fully-drained topic costs nothing. On top of that,
   retention is **Kafka-style**: it drops messages by age/size regardless of consumption, so a lagging
   group can lose un-consumed messages. Set generous retention if that matters.
+- A consumer group that stops polling is **expired after 7 idle days** (once its leases have run
+  out), so an abandoned group can't pin messages forever. A group that comes back after expiry is
+  treated as new: it re-reads whatever is still retained (at-least-once, as always).
 - A topic that sets **no** retention still gets a default safety cap of 1,000,000 messages, so an
   un-consumed (or never-acked) topic can't grow unbounded in RAM. Set explicit `retention` to raise,
   lower, or age-bound it.
@@ -365,4 +371,4 @@ cargo +nightly fuzz run response_decode -- -max_total_time=60   # server Respons
 
 ## License
 
-GPL-3.0-or-later
+AGPL-3.0-only

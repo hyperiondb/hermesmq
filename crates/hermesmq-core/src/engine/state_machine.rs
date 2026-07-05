@@ -17,11 +17,42 @@ use crate::{AppResponse, RedbStore};
 
 pub(crate) const KEY_SNAPSHOT: &str = "sm:snapshot";
 
+// Legacy (pre-0.8) snapshot bytes start with an Option tag (0x00/0x01), so a
+// 0xFF prefix unambiguously marks the versioned format.
+const SNAPSHOT_FORMAT: [u8; 2] = [0xFF, 1];
+
 #[derive(Default, Clone, Serialize, Deserialize)]
 struct StateMachineData {
     last_applied: Option<LogId<NodeId>>,
     last_membership: StoredMembership<NodeId, BasicNode>,
     queue: Queue,
+}
+
+#[derive(Deserialize)]
+struct StateMachineDataV0 {
+    last_applied: Option<LogId<NodeId>>,
+    last_membership: StoredMembership<NodeId, BasicNode>,
+    queue: crate::queue::compat::QueueV0,
+}
+
+fn encode_state(data: &StateMachineData) -> Result<Vec<u8>, StorageError<NodeId>> {
+    let mut bytes = SNAPSHOT_FORMAT.to_vec();
+    bytes.extend(enc(data)?);
+    Ok(bytes)
+}
+
+fn decode_state(bytes: &[u8]) -> Result<StateMachineData, StorageError<NodeId>> {
+    match bytes.strip_prefix(&SNAPSHOT_FORMAT) {
+        Some(rest) => dec(rest),
+        None => {
+            let v0: StateMachineDataV0 = dec(bytes)?;
+            Ok(StateMachineData {
+                last_applied: v0.last_applied,
+                last_membership: v0.last_membership,
+                queue: v0.queue.into(),
+            })
+        }
+    }
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -54,7 +85,7 @@ impl<S: Storage> StateMachineStore<S> {
         let data = match db.get(KEY_SNAPSHOT).map_err(sread)? {
             Some(bytes) => {
                 let stored: StoredSnapshot = dec(&bytes)?;
-                dec(&stored.data)?
+                decode_state(&stored.data)?
             }
             None => StateMachineData::default(),
         };
@@ -163,7 +194,7 @@ impl<S: Storage> RaftStateMachine<TypeConfig> for StateMachineStore<S> {
         snapshot: Box<Cursor<Vec<u8>>>,
     ) -> Result<(), StorageError<NodeId>> {
         let bytes = (*snapshot).into_inner();
-        let data: StateMachineData = dec(&bytes)?;
+        let data = decode_state(&bytes)?;
         let stored = StoredSnapshot {
             meta: meta.clone(),
             data: bytes,
@@ -196,9 +227,8 @@ pub struct SnapshotBuilder<S = RedbStore> {
 
 impl<S: Storage> RaftSnapshotBuilder<TypeConfig> for SnapshotBuilder<S> {
     async fn build_snapshot(&mut self) -> Result<Snapshot<TypeConfig>, StorageError<NodeId>> {
-        let (meta, bytes) = {
+        let (meta, data) = {
             let mut inner = self.inner.lock().unwrap();
-            let bytes = enc(&inner.data)?;
             inner.snapshot_seq += 1;
             let last = inner.data.last_applied;
             let snapshot_id = match &last {
@@ -210,13 +240,135 @@ impl<S: Storage> RaftSnapshotBuilder<TypeConfig> for SnapshotBuilder<S> {
                 last_membership: inner.data.last_membership.clone(),
                 snapshot_id,
             };
-            (meta, bytes)
+            (meta, inner.data.clone())
         };
+        let bytes = encode_state(&data)?;
         let stored = StoredSnapshot { meta, data: bytes };
         persist_snapshot(self.db.as_ref(), &stored)?;
         Ok(Snapshot {
             meta: stored.meta,
             snapshot: Box::new(Cursor::new(stored.data)),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::{BTreeMap, BTreeSet, VecDeque};
+
+    use bytes::Bytes;
+    use openraft::CommittedLeaderId;
+    use serde::Serialize;
+
+    use super::*;
+    use crate::types::{ContentType, Message, Priority};
+    use crate::AppRequest;
+
+    #[derive(Serialize)]
+    struct OldGroup {
+        ack_watermark: u64,
+        acked_above: BTreeSet<u64>,
+        in_flight: BTreeMap<u64, (u64, u64)>,
+        leased_offsets: BTreeMap<u64, u64>,
+        poll_count: u64,
+    }
+
+    #[derive(Serialize)]
+    struct OldTopic {
+        next_offset: u64,
+        messages: BTreeMap<u64, Message>,
+        dedup: BTreeMap<(String, u64), u64>,
+        dedup_order: VecDeque<(String, u64)>,
+        groups: BTreeMap<String, OldGroup>,
+        rate_milli_per_sec: u64,
+        burst: u32,
+        retain_max_messages: u64,
+        retain_max_age_ms: u64,
+    }
+
+    #[derive(Serialize)]
+    struct OldQueue {
+        topics: BTreeMap<String, OldTopic>,
+        next_lease_id: u64,
+    }
+
+    #[derive(Serialize)]
+    struct OldData {
+        last_applied: Option<LogId<NodeId>>,
+        last_membership: StoredMembership<NodeId, BasicNode>,
+        queue: OldQueue,
+    }
+
+    #[test]
+    fn legacy_snapshot_bytes_decode_and_convert() {
+        let mut groups = BTreeMap::new();
+        groups.insert(
+            "g".to_string(),
+            OldGroup {
+                ack_watermark: 1,
+                acked_above: BTreeSet::new(),
+                in_flight: BTreeMap::from([(7u64, (1u64, 500u64))]),
+                leased_offsets: BTreeMap::from([(1u64, 500u64)]),
+                poll_count: 3,
+            },
+        );
+        let mut topics = BTreeMap::new();
+        topics.insert(
+            "t".to_string(),
+            OldTopic {
+                next_offset: 2,
+                messages: BTreeMap::from([(
+                    1u64,
+                    Message {
+                        offset: 1,
+                        priority: Priority(0),
+                        content_type: ContentType::Raw,
+                        payload: Bytes::from_static(b"x"),
+                        ts_ms: 0,
+                    },
+                )]),
+                dedup: BTreeMap::new(),
+                dedup_order: VecDeque::new(),
+                groups,
+                rate_milli_per_sec: 0,
+                burst: 0,
+                retain_max_messages: 0,
+                retain_max_age_ms: 0,
+            },
+        );
+        let old = OldData {
+            last_applied: Some(LogId::new(CommittedLeaderId::new(2, 1), 9)),
+            last_membership: StoredMembership::default(),
+            queue: OldQueue {
+                topics,
+                next_lease_id: 8,
+            },
+        };
+        let bytes = postcard::to_stdvec(&old).unwrap();
+
+        let data = decode_state(&bytes).expect("legacy snapshot bytes must still decode");
+        assert_eq!(data.last_applied.map(|l| l.index), Some(9));
+        let m = data.queue.metrics();
+        assert_eq!((m.topics, m.messages, m.in_flight), (1, 1, 1));
+        assert!(!data.queue.has_deliverable("t", "g", 100), "lease still active");
+        assert!(data.queue.has_deliverable("t", "g", 1_000), "lease expired at 500");
+    }
+
+    #[test]
+    fn snapshot_state_roundtrips_in_versioned_format() {
+        let mut data = StateMachineData::default();
+        data.queue.apply(AppRequest::Produce {
+            topic: crate::TopicId::from("t"),
+            priority: Priority(0),
+            content_type: ContentType::Raw,
+            payload: Bytes::from_static(b"hello"),
+            producer_id: String::new(),
+            seq: 0,
+            ts_ms: 0,
+        });
+        let bytes = encode_state(&data).unwrap();
+        assert_eq!(&bytes[..2], &SNAPSHOT_FORMAT);
+        let back = decode_state(&bytes).unwrap();
+        assert_eq!(back.queue.metrics().messages, 1);
     }
 }

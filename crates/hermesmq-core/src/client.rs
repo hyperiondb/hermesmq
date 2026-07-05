@@ -9,10 +9,10 @@ use openraft::BasicNode;
 use prost::Message;
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{mpsc, oneshot, Notify};
+use tokio::sync::{mpsc, oneshot, Notify, Semaphore};
 
 use crate::engine::{HermesRaft, StateMachineStore};
-use crate::frame::{read_frame, write_frame};
+use crate::frame::{read_frame, write_frame, MAX_CLIENT_FRAME};
 use crate::raft::{AppRequest, AppResponse, Delivered, ProduceItem};
 use crate::types::{ContentType, GroupId, LeaseId, NodeId, Offset, Priority, TopicId};
 
@@ -28,8 +28,10 @@ const PIPELINE_DEPTH: usize = 32;
 const PRODUCE_QUEUE_DEPTH: usize = 1024;
 const PRODUCE_BATCH_MAX_ITEMS: usize = 256;
 const PRODUCE_BATCH_MAX_BYTES: usize = 512 * 1024;
+const PRODUCE_WRITE_PIPELINE: usize = 4;
 const ACK_QUEUE_DEPTH: usize = 1024;
 const ACK_BATCH_MAX: usize = 1024;
+const ACK_WRITE_PIPELINE: usize = 4;
 const ACK_GRACE_MS: u64 = 5_000;
 
 struct OffsetTrack {
@@ -381,7 +383,9 @@ async fn produce_batcher(
     notifiers: Arc<StdMutex<HashMap<String, Arc<Notify>>>>,
     mut rx: mpsc::Receiver<ProduceJob>,
 ) {
+    let permits = Arc::new(Semaphore::new(PRODUCE_WRITE_PIPELINE));
     while let Some(first) = rx.recv().await {
+        let permit = permits.clone().acquire_owned().await.unwrap();
         let mut jobs = vec![first];
         let mut bytes = jobs[0].p.payload.len();
         while jobs.len() < PRODUCE_BATCH_MAX_ITEMS && bytes < PRODUCE_BATCH_MAX_BYTES {
@@ -393,54 +397,66 @@ async fn produce_batcher(
                 Err(_) => break,
             }
         }
+        let raft = raft.clone();
+        let notifiers = notifiers.clone();
+        tokio::spawn(async move {
+            write_produce_batch(&raft, &notifiers, jobs).await;
+            drop(permit);
+        });
+    }
+}
 
-        let ts_ms = now_ms();
-        let mut items = Vec::with_capacity(jobs.len());
-        let mut replies = Vec::with_capacity(jobs.len());
-        let mut topics: Vec<String> = Vec::new();
-        for job in jobs {
-            if !topics.contains(&job.p.topic) {
-                topics.push(job.p.topic.clone());
-            }
-            items.push(ProduceItem {
-                topic: TopicId(job.p.topic),
-                priority: Priority(job.p.priority.min(MAX_PRIORITY) as u8),
-                content_type: ct_from_u32(job.p.content_type),
-                payload: job.p.payload,
-                producer_id: job.p.producer_id,
-                seq: job.p.seq,
-                ts_ms,
-            });
-            replies.push(job.reply);
+async fn write_produce_batch(
+    raft: &HermesRaft,
+    notifiers: &StdMutex<HashMap<String, Arc<Notify>>>,
+    jobs: Vec<ProduceJob>,
+) {
+    let ts_ms = now_ms();
+    let mut items = Vec::with_capacity(jobs.len());
+    let mut replies = Vec::with_capacity(jobs.len());
+    let mut topics: Vec<String> = Vec::new();
+    for job in jobs {
+        if !topics.contains(&job.p.topic) {
+            topics.push(job.p.topic.clone());
         }
+        items.push(ProduceItem {
+            topic: TopicId(job.p.topic),
+            priority: Priority(job.p.priority.min(MAX_PRIORITY) as u8),
+            content_type: ct_from_u32(job.p.content_type),
+            payload: job.p.payload,
+            producer_id: job.p.producer_id,
+            seq: job.p.seq,
+            ts_ms,
+        });
+        replies.push(job.reply);
+    }
 
-        match raft.client_write(AppRequest::ProduceMany { items }).await {
-            Ok(resp) => match resp.data {
-                AppResponse::ProducedMany { offsets } => {
-                    for (reply, offset) in replies.into_iter().zip(offsets) {
-                        let _ = reply.send(Response {
-                            kind: Some(response::Kind::Produced(proto::Produced { offset })),
-                        });
-                    }
-                    let map = notifiers.lock().unwrap();
-                    for topic in &topics {
-                        if let Some(notifier) = map.get(topic) {
-                            notifier.notify_waiters();
-                        }
+    match raft.client_write(AppRequest::ProduceMany { items }).await {
+        Ok(resp) => match resp.data {
+            AppResponse::ProducedMany { offsets } => {
+                for (reply, offset) in replies.into_iter().zip(offsets) {
+                    let _ = reply.send(Response {
+                        kind: Some(response::Kind::Produced(proto::Produced { offset })),
+                    });
+                }
+                let map = notifiers.lock().unwrap();
+                for topic in &topics {
+                    if let Some(notifier) = map.get(topic) {
+                        notifier.notify_waiters();
                     }
                 }
-                other => {
-                    let resp = resp_error("internal", format!("unexpected batch response: {other:?}"));
-                    for reply in replies {
-                        let _ = reply.send(resp.clone());
-                    }
-                }
-            },
-            Err(e) => {
-                let resp = map_raft_error(e);
+            }
+            other => {
+                let resp = resp_error("internal", format!("unexpected batch response: {other:?}"));
                 for reply in replies {
                     let _ = reply.send(resp.clone());
                 }
+            }
+        },
+        Err(e) => {
+            let resp = map_raft_error(e);
+            for reply in replies {
+                let _ = reply.send(resp.clone());
             }
         }
     }
@@ -453,7 +469,9 @@ async fn ack_batcher(
     notifiers: Arc<StdMutex<HashMap<String, Arc<Notify>>>>,
     mut rx: mpsc::Receiver<AckJob>,
 ) {
+    let permits = Arc::new(Semaphore::new(ACK_WRITE_PIPELINE));
     while let Some(first) = rx.recv().await {
+        let permit = permits.clone().acquire_owned().await.unwrap();
         let mut jobs = vec![first];
         while jobs.len() < ACK_BATCH_MAX {
             match rx.try_recv() {
@@ -471,29 +489,42 @@ async fn ack_batcher(
             }
         }
 
-        for ((topic, group, nack), (lease_ids, replies)) in groups {
-            let app = if nack {
-                AppRequest::NackMany {
-                    topic: TopicId(topic.clone()),
-                    group: GroupId(group),
-                    lease_ids,
-                }
-            } else {
-                AppRequest::AckMany {
-                    topic: TopicId(topic.clone()),
-                    group: GroupId(group),
-                    lease_ids,
-                }
-            };
-            let resp = write_and_map(&raft, app).await;
-            let ok = matches!(resp.kind, Some(response::Kind::Ok(_)));
-            for reply in replies {
-                let _ = reply.send(resp.clone());
+        let raft = raft.clone();
+        let notifiers = notifiers.clone();
+        tokio::spawn(async move {
+            write_ack_groups(&raft, &notifiers, groups).await;
+            drop(permit);
+        });
+    }
+}
+
+async fn write_ack_groups(
+    raft: &HermesRaft,
+    notifiers: &StdMutex<HashMap<String, Arc<Notify>>>,
+    groups: BTreeMap<(String, String, bool), AckGroup>,
+) {
+    for ((topic, group, nack), (lease_ids, replies)) in groups {
+        let app = if nack {
+            AppRequest::NackMany {
+                topic: TopicId(topic.clone()),
+                group: GroupId(group),
+                lease_ids,
             }
-            if nack && ok {
-                if let Some(notifier) = notifiers.lock().unwrap().get(&topic) {
-                    notifier.notify_waiters();
-                }
+        } else {
+            AppRequest::AckMany {
+                topic: TopicId(topic.clone()),
+                group: GroupId(group),
+                lease_ids,
+            }
+        };
+        let resp = write_and_map(raft, app).await;
+        let ok = matches!(resp.kind, Some(response::Kind::Ok(_)));
+        for reply in replies {
+            let _ = reply.send(resp.clone());
+        }
+        if nack && ok {
+            if let Some(notifier) = notifiers.lock().unwrap().get(&topic) {
+                notifier.notify_waiters();
             }
         }
     }
@@ -538,12 +569,22 @@ async fn handle_poll(ctx: &Ctx, p: proto::Poll) -> Response {
                 }
                 None => max,
             };
-            let app = AppRequest::Poll {
-                topic: topic.clone(),
-                group: group.clone(),
-                max: grant,
-                visibility_timeout_ms: visibility,
-                ts_ms: now_ms(),
+            let app = if p.ack_mode == "auto" {
+                AppRequest::PollAuto {
+                    topic: topic.clone(),
+                    group: group.clone(),
+                    max: grant,
+                    visibility_timeout_ms: visibility,
+                    ts_ms: now_ms(),
+                }
+            } else {
+                AppRequest::Poll {
+                    topic: topic.clone(),
+                    group: group.clone(),
+                    max: grant,
+                    visibility_timeout_ms: visibility,
+                    ts_ms: now_ms(),
+                }
             };
             let resp = match ctx.raft.client_write(app).await {
                 Ok(r) => r,
@@ -561,17 +602,6 @@ async fn handle_poll(ctx: &Ctx, p: proto::Poll) -> Response {
                 );
             }
             if !items.is_empty() {
-                if p.ack_mode == "auto" {
-                    let lease_ids = items.iter().map(|d| d.lease_id).collect();
-                    let _ = ctx
-                        .raft
-                        .client_write(AppRequest::AckMany {
-                            topic: topic.clone(),
-                            group: group.clone(),
-                            lease_ids,
-                        })
-                        .await;
-                }
                 return resp_polled(items);
             }
         }
@@ -748,7 +778,7 @@ async fn handle_subscribe(
         let closed = closed.clone();
         tokio::spawn(async move {
             loop {
-                let bytes = match read_frame(&mut read_half).await {
+                let bytes = match read_frame(&mut read_half, MAX_CLIENT_FRAME).await {
                     Ok(b) => b,
                     Err(_) => break,
                 };
@@ -833,12 +863,22 @@ async fn handle_subscribe(
                 None => Some(want),
             };
             if let Some(grant) = grant {
-                let app = AppRequest::Poll {
-                    topic: topic.clone(),
-                    group: group.clone(),
-                    max: grant,
-                    visibility_timeout_ms: visibility,
-                    ts_ms: now_ms(),
+                let app = if auto {
+                    AppRequest::PollAuto {
+                        topic: topic.clone(),
+                        group: group.clone(),
+                        max: grant,
+                        visibility_timeout_ms: visibility,
+                        ts_ms: now_ms(),
+                    }
+                } else {
+                    AppRequest::Poll {
+                        topic: topic.clone(),
+                        group: group.clone(),
+                        max: grant,
+                        visibility_timeout_ms: visibility,
+                        ts_ms: now_ms(),
+                    }
                 };
                 match ctx.raft.client_write(app).await {
                     Ok(r) => {
@@ -849,17 +889,6 @@ async fn handle_subscribe(
                                     grant.saturating_sub(items.len() as u32),
                                     burst.max(1) as f64,
                                 );
-                            }
-                            if auto && !items.is_empty() {
-                                let lease_ids = items.iter().map(|d| d.lease_id).collect();
-                                let _ = ctx
-                                    .raft
-                                    .client_write(AppRequest::AckMany {
-                                        topic: topic.clone(),
-                                        group: group.clone(),
-                                        lease_ids,
-                                    })
-                                    .await;
                             }
                             for d in items {
                                 pushed_any = true;
@@ -967,7 +996,7 @@ async fn handle_client(ctx: Ctx, stream: TcpStream) -> io::Result<()> {
     });
 
     let sub = loop {
-        let bytes = match read_frame(&mut read_half).await {
+        let bytes = match read_frame(&mut read_half, MAX_CLIENT_FRAME).await {
             Ok(b) => b,
             Err(_) => break None,
         };
