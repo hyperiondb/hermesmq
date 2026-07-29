@@ -613,14 +613,14 @@ checksum = "2304e00983f87ffb38b55b444b5e3b60a884b5d30c0fca7d82fe33449bbe55ea"
 
 [[package]]
 name = "hermesmq"
-version = "0.8.0"
+version = "0.8.1"
 dependencies = [
  "hermesmq-core",
 ]
 
 [[package]]
 name = "hermesmq-core"
-version = "0.8.0"
+version = "0.8.1"
 dependencies = [
  "bytes",
  "hermesmq-proto",
@@ -638,7 +638,7 @@ dependencies = [
 
 [[package]]
 name = "hermesmq-proto"
-version = "0.8.0"
+version = "0.8.1"
 dependencies = [
  "prost",
  "prost-build",
@@ -647,7 +647,7 @@ dependencies = [
 
 [[package]]
 name = "hermesmqd"
-version = "0.8.0"
+version = "0.8.1"
 dependencies = [
  "anyhow",
  "clap",
@@ -896,9 +896,9 @@ checksum = "384b8ab6d37215f3c5301a95a4accb5d64aa607f1fcb26a11b5303878451b4fe"
 
 [[package]]
 name = "openraft"
-version = "0.9.24"
+version = "0.9.25"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "80d35e2f60cdf9bcfc39a020966091017c6dc2a4b43b355a22ca3e76106f4a0a"
+checksum = "a97014fb78acb77be3a40ac2da305f6dd3a6b243f3a908ace87d29b3972eaafd"
 dependencies = [
  "anyerror",
  "byte-unit",

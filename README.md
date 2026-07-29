@@ -1,5 +1,7 @@
 # HermesMQ
 
+[![Code health](https://api.repowise.dev/badge/health/hyperiondb/hermesmq.svg)](https://repowise.dev/repo/hyperiondb/hermesmq)
+
 The simple af, performant, durable Kafka-like **Raft-replicated message queue**.
 
 Status: **in production**
