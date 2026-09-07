@@ -15,7 +15,8 @@ use crate::storage::Storage;
 use crate::types::NodeId;
 use crate::{AppResponse, RedbStore};
 
-pub(crate) const KEY_SNAPSHOT: &str = "sm:snapshot";
+#[doc(hidden)]
+pub const KEY_SNAPSHOT: &str = "sm:snapshot";
 
 // Legacy (pre-0.8) snapshot bytes start with an Option tag (0x00/0x01), so a
 // 0xFF prefix unambiguously marks the versioned format.
@@ -41,24 +42,61 @@ fn encode_state(data: &StateMachineData) -> Result<Vec<u8>, StorageError<NodeId>
     Ok(bytes)
 }
 
+/// Decode snapshot bytes and refuse the ones the queue could not have produced.
+///
+/// Snapshot bytes arrive two ways: the record on disk, read on every start, and
+/// the peer port, which hands whatever a peer sends to the Raft snapshot
+/// installer. Decoding used to be the only check, so any state postcard could
+/// parse replaced the queue wholesale — including states with counters at the
+/// top of their range (which then wrap or panic on the next request) and with a
+/// dedup map its eviction queue cannot reach.
 fn decode_state(bytes: &[u8]) -> Result<StateMachineData, StorageError<NodeId>> {
-    match bytes.strip_prefix(&SNAPSHOT_FORMAT) {
-        Some(rest) => dec(rest),
+    let mut data: StateMachineData = match bytes.strip_prefix(&SNAPSHOT_FORMAT) {
+        Some(rest) => dec(rest)?,
         None => {
             let v0: StateMachineDataV0 = dec(bytes)?;
-            Ok(StateMachineData {
+            StateMachineData {
                 last_applied: v0.last_applied,
                 last_membership: v0.last_membership,
                 queue: v0.queue.into(),
-            })
+            }
         }
+    };
+    data.queue.normalize();
+    if let Err(reason) = data.queue.validate() {
+        return Err(sread(format!("snapshot state is not self-consistent: {reason}")));
     }
+    Ok(data)
 }
 
 #[derive(Clone, Serialize, Deserialize)]
 struct StoredSnapshot {
     meta: SnapshotMeta<NodeId, BasicNode>,
     data: Vec<u8>,
+}
+
+/// Decode of snapshot body bytes, exposed for the fuzz targets.
+#[doc(hidden)]
+pub fn fuzz_decode_state(bytes: &[u8]) -> bool {
+    decode_state(bytes).is_ok()
+}
+
+/// Write a snapshot record straight into the store, exposed for the fuzz targets.
+#[doc(hidden)]
+pub fn fuzz_store_snapshot<S: Storage>(
+    db: &S,
+    last_log_id: Option<LogId<NodeId>>,
+    data: Vec<u8>,
+) -> Result<(), StorageError<NodeId>> {
+    let stored = StoredSnapshot {
+        meta: SnapshotMeta {
+            last_log_id,
+            last_membership: StoredMembership::default(),
+            snapshot_id: "fuzz".to_string(),
+        },
+        data,
+    };
+    persist_snapshot(db, &stored)
 }
 
 struct Inner {
@@ -99,20 +137,36 @@ impl<S: Storage> StateMachineStore<S> {
     }
 
     pub fn rate_config(&self, topic: &str) -> Option<(u64, u32)> {
-        self.inner.lock().unwrap().data.queue.rate_config(topic)
+        crate::lock(&self.inner).data.queue.rate_config(topic)
     }
 
     pub fn metrics(&self) -> crate::queue::QueueMetrics {
-        self.inner.lock().unwrap().data.queue.metrics()
+        crate::lock(&self.inner).data.queue.metrics()
     }
 
     pub fn has_deliverable(&self, topic: &str, group: &str, now_ms: u64) -> bool {
-        self.inner
-            .lock()
-            .unwrap()
+        crate::lock(&self.inner)
             .data
             .queue
             .has_deliverable(topic, group, now_ms)
+    }
+
+    /// Whether a request naming this topic can proceed, so the client port can
+    /// turn one away before it becomes a replicated write.
+    pub fn topic_admits(&self, topic: &str) -> bool {
+        crate::lock(&self.inner).data.queue.topic_admits(topic)
+    }
+
+    /// Apply one request directly to the installed queue, exposed for the fuzz targets.
+    #[doc(hidden)]
+    pub fn debug_apply(&self, req: crate::AppRequest) -> AppResponse {
+        crate::lock(&self.inner).data.queue.apply(req)
+    }
+
+    /// Run [`Queue::debug_check_invariants`] over the installed queue.
+    #[doc(hidden)]
+    pub fn debug_check_invariants(&self) -> Result<(), String> {
+        crate::lock(&self.inner).data.queue.debug_check_invariants()
     }
 }
 
@@ -148,7 +202,7 @@ impl<S: Storage> RaftStateMachine<TypeConfig> for StateMachineStore<S> {
         &mut self,
     ) -> Result<(Option<LogId<NodeId>>, StoredMembership<NodeId, BasicNode>), StorageError<NodeId>>
     {
-        let inner = self.inner.lock().unwrap();
+        let inner = crate::lock(&self.inner);
         Ok((inner.data.last_applied, inner.data.last_membership.clone()))
     }
 
@@ -157,7 +211,7 @@ impl<S: Storage> RaftStateMachine<TypeConfig> for StateMachineStore<S> {
         I: IntoIterator<Item = Entry<TypeConfig>> + OptionalSend,
         I::IntoIter: OptionalSend,
     {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = crate::lock(&self.inner);
         let mut responses = Vec::new();
         for entry in entries {
             let log_id = entry.log_id;
@@ -200,7 +254,7 @@ impl<S: Storage> RaftStateMachine<TypeConfig> for StateMachineStore<S> {
             data: bytes,
         };
         persist_snapshot(self.db.as_ref(), &stored)?;
-        self.inner.lock().unwrap().data = data;
+        crate::lock(&self.inner).data = data;
         Ok(())
     }
 
@@ -228,7 +282,7 @@ pub struct SnapshotBuilder<S = RedbStore> {
 impl<S: Storage> RaftSnapshotBuilder<TypeConfig> for SnapshotBuilder<S> {
     async fn build_snapshot(&mut self) -> Result<Snapshot<TypeConfig>, StorageError<NodeId>> {
         let (meta, data) = {
-            let mut inner = self.inner.lock().unwrap();
+            let mut inner = crate::lock(&self.inner);
             inner.snapshot_seq += 1;
             let last = inner.data.last_applied;
             let snapshot_id = match &last {
@@ -352,6 +406,70 @@ mod tests {
         assert_eq!((m.topics, m.messages, m.in_flight), (1, 1, 1));
         assert!(!data.queue.has_deliverable("t", "g", 100), "lease still active");
         assert!(data.queue.has_deliverable("t", "g", 1_000), "lease expired at 500");
+    }
+
+    fn legacy_bytes(topic: OldTopic, next_lease_id: u64) -> Vec<u8> {
+        postcard::to_stdvec(&OldData {
+            last_applied: None,
+            last_membership: StoredMembership::default(),
+            queue: OldQueue {
+                topics: BTreeMap::from([("t".to_string(), topic)]),
+                next_lease_id,
+            },
+        })
+        .unwrap()
+    }
+
+    fn empty_topic(next_offset: u64) -> OldTopic {
+        OldTopic {
+            next_offset,
+            messages: BTreeMap::new(),
+            dedup: BTreeMap::new(),
+            dedup_order: VecDeque::new(),
+            groups: BTreeMap::new(),
+            rate_milli_per_sec: 0,
+            burst: 0,
+            retain_max_messages: 0,
+            retain_max_age_ms: 0,
+        }
+    }
+
+    #[test]
+    fn a_snapshot_with_an_impossible_counter_is_refused() {
+        let bytes = legacy_bytes(empty_topic(u64::MAX), 0);
+        assert!(
+            decode_state(&bytes).is_err(),
+            "an offset counter at the top of its range must not be installed"
+        );
+    }
+
+    #[test]
+    fn a_snapshot_whose_dedup_queue_cannot_evict_is_refused() {
+        let mut topic = empty_topic(1);
+        topic.dedup = BTreeMap::from([(("p".to_string(), 0u64), 0u64)]);
+        let bytes = legacy_bytes(topic, 0);
+        assert!(
+            decode_state(&bytes).is_err(),
+            "a dedup entry the eviction queue cannot reach must not be installed"
+        );
+    }
+
+    #[test]
+    fn a_legacy_watermark_past_the_end_is_normalized() {
+        let mut topic = empty_topic(2);
+        topic.groups = BTreeMap::from([(
+            "g".to_string(),
+            OldGroup {
+                ack_watermark: u64::MAX,
+                acked_above: BTreeSet::new(),
+                in_flight: BTreeMap::new(),
+                leased_offsets: BTreeMap::new(),
+                poll_count: 0,
+            },
+        )]);
+        let bytes = legacy_bytes(topic, 0);
+        let data = decode_state(&bytes).expect("a watermark an old commit could set must still load");
+        assert_eq!(data.queue.validate(), Ok(()));
     }
 
     #[test]

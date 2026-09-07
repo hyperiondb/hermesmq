@@ -45,7 +45,12 @@ The chart is regenerated from the measured numbers on every `cargo perf` run.
 ```sh
 cargo build --release
 cargo test # unit + client-protocol + cluster + durability + http + slow-disk
+cargo e2e  # end-to-end against a 3-node Docker cluster (needs Docker + compose v2)
+cargo perf # throughput and latency, release only; regenerates performance.png
 ```
+
+`cargo test` skips the last two: both are marked `#[ignore]` so an ordinary test run does not
+require Docker or spend time measuring. See [Testing](#testing) for what each one does.
 
 ## Run a node
 
@@ -70,6 +75,8 @@ addon's `connect()` does this automatically).
 | `--peer-addr` | `HERMESMQ_PEER_ADDR` | `127.0.0.1:7700` | Inter-node Raft RPC listener |
 | `--metrics-addr` | `HERMESMQ_METRICS_ADDR` | `127.0.0.1:9600` | HTTP `/health` `/ready` `/metrics` |
 | `--metrics-enabled` | `HERMESMQ_METRICS_ENABLED` | `true` | `false` disables Prometheus `/metrics` (`/health` and `/ready` stay on) |
+| `--client-token` | `HERMESMQ_CLIENT_TOKEN` | unset | Shared secret a client must send before any request is served |
+| `--peer-token` | `HERMESMQ_PEER_TOKEN` | unset | Shared secret every peer connection must present, in both directions |
 
 Every flag can also be set via its environment variable; a CLI flag takes precedence. The Docker
 image bakes in container-appropriate defaults (`0.0.0.0` listeners, `/data` data dir), so a
@@ -257,18 +264,22 @@ The client auto-discovers the leader (rotates through nodes on `not_leader`/unre
 ## Protocol
 
 Length-prefixed frames (`u32` big-endian length + Protobuf body). One `Request`/`Response` envelope
-(`hermesmq.proto`); the message payload is an opaque `bytes` field. Ops: `bootstrap`, `produce`,
-`poll`, `subscribe`, `ack`, `nack`, `commit`, `create_topic`, `delete_topic`, `set_rate_limit`,
-`set_retention`, `stats`. `subscribe` takes over its connection: the leader pushes `Delivered`
+(`hermesmq.proto`); the message payload is an opaque `bytes` field. Ops: `auth`, `bootstrap`,
+`produce`, `poll`, `subscribe`, `ack`, `nack`, `commit`, `create_topic`, `delete_topic`,
+`set_rate_limit`, `set_retention`, `stats`. `auth` is only required when the server was started with
+`--client-token`, and must then be the first frame on the connection; against a server with no token
+it is answered `ok` and changes nothing. `subscribe` takes over its connection: the leader pushes `Delivered`
 frames and reads `ack`/`nack` frames back on the same socket. Inter-node Raft RPC uses the same
 framing with postcard-encoded openraft messages (one persistent connection per peer).
 
 Server-side limits and defaults (applied when a field is `0`): client frames are capped at
 **2 MiB** and peer-RPC frames at 64 MiB, produce payloads are capped at
 **1 MiB** (`payload_too_large` otherwise), poll `max` defaults to 16 (capped at 1024),
-`visibility_timeout_ms` defaults to 30 000, `wait_ms` is capped at 300 000, and `priority` is
-clamped to 0–7. `not_leader` errors include the current leader's peer address in `leader_addr`
-when one is known.
+`visibility_timeout_ms` defaults to 30 000 and is capped at 12 hours, `wait_ms` is capped at
+300 000, and `priority` is clamped to 0–7. Topic names, group names and producer ids are capped at
+256 bytes each (`bad_request` otherwise), and a request that would push the cluster past 10 000
+topics or a topic past 1 000 consumer groups is answered `rejected`. `not_leader` errors include the
+current leader's peer address in `leader_addr` when one is known.
 
 Requests may be **pipelined**: a client can send further frames without waiting for responses
 (up to 32 are processed concurrently per connection; beyond that, TCP backpressure applies).
@@ -348,24 +359,114 @@ latency (p50/p99/p99.9), and 3-node replicated writes.
 
 ### Fuzzing
 
-Nightly + [cargo-fuzz](https://github.com/rust-fuzz/cargo-fuzz). Targets decode untrusted protobuf wire bytes and are bounded so they exit:
+Nightly + [cargo-fuzz](https://github.com/rust-fuzz/cargo-fuzz). Every target is bounded so it
+exits. Run from the `fuzz/` directory.
+
+Decoders fed untrusted bytes:
 
 ```sh
-cargo +nightly fuzz run request_decode  -- -max_total_time=60   # client Request (protobuf, server-side)
-cargo +nightly fuzz run response_decode -- -max_total_time=60   # server Response (protobuf, client-side)
+cargo +nightly fuzz run request_decode    -- -max_total_time=60   # client Request (protobuf, server-side)
+cargo +nightly fuzz run response_decode   -- -max_total_time=60   # server Response (protobuf, client-side)
+cargo +nightly fuzz run peer_frame_decode -- -max_total_time=60   # peer RPC (postcard, unauthenticated port)
+cargo +nightly fuzz run log_entry_decode  -- -max_total_time=60   # one log entry read back out of redb
+cargo +nightly fuzz run http_request      -- -max_total_time=60   # HTTP request-line parser
 ```
+
+Queue state machine, driven by generated request sequences:
+
+```sh
+cargo +nightly fuzz run queue_ops          -- -max_total_time=60  # internal invariants after every step
+cargo +nightly fuzz run queue_determinism  -- -max_total_time=60  # two nodes must reach identical state
+cargo +nightly fuzz run snapshot_roundtrip -- -max_total_time=60  # a restored node must behave the same
+cargo +nightly fuzz run snapshot_install   -- -max_total_time=60  # attacker-shaped snapshot, then ordinary requests
+cargo +nightly fuzz run batch_equivalence  -- -max_total_time=60  # batched ops == the same ops one at a time
+```
+
+Storage, framing and per-connection bookkeeping:
+
+```sh
+cargo +nightly fuzz run store_model     -- -max_total_time=60     # log store vs. an ordered-map model
+cargo +nightly fuzz run recovery_state  -- -max_total_time=60     # startup repair over a damaged store
+cargo +nightly fuzz run frame_roundtrip -- -max_total_time=60     # length-prefixed codec
+cargo +nightly fuzz run sub_tracking    -- -max_total_time=60     # subscription lease bookkeeping
+cargo +nightly fuzz run rate_limiter    -- -max_total_time=60     # token bucket float math
+```
+
+For the targets that decode untrusted bytes, add `-rss_limit_mb=2048 -malloc_limit_mb=512` so an
+oversized allocation is reported as a crash instead of an out-of-memory kill.
+
+Findings from the last fuzzing run are in [VULN.md](VULN.md), together with what each one does now.
+The reproduction harness runs every case against the current code:
+
+```sh
+cargo run -p hermesmq-core --example security_repro
+```
+
+**On Windows (MSVC)** the build needs `RUSTFLAGS="-Clink-arg=/FORCE:UNRESOLVED"`: `redb` declares
+`crate-type = ["cdylib", "rlib"]`, cargo builds every declared crate type for a dependency, and that
+unused DLL cannot resolve the coverage symbols or `main`. The flag is not needed on Linux, and
+`--sanitizer=none` produces binaries that crash at libFuzzer startup on Windows — use the default
+address-sanitizer build.
+
+## Authentication
+
+Both TCP ports take an optional shared secret. Authentication is **off unless a token is set**, and
+the server logs a warning at startup for each port left open.
+
+```sh
+hermesmqd --client-token "$CLIENT_SECRET" --peer-token "$PEER_SECRET"
+```
+
+- **Client port.** With `--client-token` set, a connection must send an `Auth` request carrying the
+  token as its first message. Every other request is answered `unauthorized` and the connection is
+  closed, so guessing costs a new handshake each time.
+- **Peer port.** With `--peer-token` set, a peer must present the token on each connection it opens,
+  before any `AppendEntries`, `Vote` or `InstallSnapshot`. Set the **same value on every node**: the
+  flag controls both what a node demands of incoming connections and what it presents on outgoing
+  ones. A mismatch looks like an unreachable peer.
+
+There is still **no transport encryption**. A token stops an unauthorized host from producing,
+consuming, reconfiguring topics, bootstrapping an un-bootstrapped node or joining the Raft group; it
+does not hide traffic from anyone who can read the wire. Terminate TLS in front of the ports, or keep
+them on a private network, if confidentiality matters.
+
+## Limits
+
+These bound how much one client can add to the replicated state. They are compiled in rather than
+configured, because every replica has to reach the same decision for the same request. A request over
+a limit is answered with an error and changes nothing - except the visibility timeout, which is
+clamped to the cap rather than refused.
+
+| Limit | Value | Applies to |
+|---|---|---|
+| Payload size | 1 MiB | One message |
+| Client frame size | 2 MiB | One request or response |
+| Peer frame size | 64 MiB | One Raft RPC |
+| Topic name, group name | 256 bytes each | Every request naming one |
+| Producer id | 256 bytes | Produce |
+| Topics | 10,000 | Whole cluster |
+| Consumer groups | 1,000 | Per topic |
+| Visibility timeout | 12 hours | Poll and subscribe; longer values are clamped |
+| Concurrent connections | 4,096 client, 256 peer, 256 HTTP | Per listener |
+
+A frame body has 30 seconds to arrive once its length header has been read, and an HTTP request head
+10 seconds. Neither deadline applies to a connection that is simply idle.
 
 ## Caveats
 
-- The TCP and peer-RPC ports have **no auth/TLS** — only run on a trusted/private network. Add a
-  token + TLS before any untrusted exposure, and firewall the peer port to cluster hosts only.
+- The TCP and peer-RPC ports have **no TLS**, and no authentication unless you set `--client-token`
+  and `--peer-token` (see [Authentication](#authentication)). Firewall the peer port to cluster hosts.
 - Memory is reclaimed two ways. Messages that **every** group has acked past are dropped
   automatically (consumption-based), so a fully-drained topic costs nothing. On top of that,
   retention is **Kafka-style**: it drops messages by age/size regardless of consumption, so a lagging
   group can lose un-consumed messages. Set generous retention if that matters.
 - A consumer group that stops polling is **expired after 7 idle days** (once its leases have run
   out), so an abandoned group can't pin messages forever. A group that comes back after expiry is
-  treated as new: it re-reads whatever is still retained (at-least-once, as always).
+  treated as new: it re-reads whatever is still retained (at-least-once, as always). The sweep runs
+  on any produce, poll or commit against the topic.
+- The **producer dedup table is bounded by retention**: a `(producer_id, seq)` pair is dropped once
+  the message it points at has been retained out. Re-sending a produce for a message that is no
+  longer retained stores it again under a new offset.
 - A topic that sets **no** retention still gets a default safety cap of 1,000,000 messages, so an
   un-consumed (or never-acked) topic can't grow unbounded in RAM. Set explicit `retention` to raise,
   lower, or age-bound it.

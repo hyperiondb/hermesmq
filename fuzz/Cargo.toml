@@ -9,10 +9,16 @@ cargo-fuzz = true
 
 [dependencies]
 libfuzzer-sys = "0.4"
+arbitrary = { version = "1", features = ["derive"] }
 prost = "0.13"
 bytes = "1"
+postcard = { version = "1", features = ["use-std"] }
+serde = { version = "1", features = ["derive"] }
+openraft = { version = "=0.9.25", features = ["serde", "storage-v2", "loosen-follower-log-revert"] }
+tokio = { version = "1", features = ["rt", "macros", "sync", "time", "io-util"] }
 
 hermesmq-proto = { path = "../crates/hermesmq-proto" }
+hermesmq-core = { path = "../crates/hermesmq-core" }
 
 # Detached from the parent workspace so `cargo build/test` and the stable-pinned
 # CI never try to compile this nightly-only crate.
@@ -31,6 +37,97 @@ bench = false
 [[bin]]
 name = "response_decode"
 path = "fuzz_targets/response_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "snapshot_install"
+path = "fuzz_targets/snapshot_install.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "peer_frame_decode"
+path = "fuzz_targets/peer_frame_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "queue_ops"
+path = "fuzz_targets/queue_ops.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "queue_determinism"
+path = "fuzz_targets/queue_determinism.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "snapshot_roundtrip"
+path = "fuzz_targets/snapshot_roundtrip.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "log_entry_decode"
+path = "fuzz_targets/log_entry_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "store_model"
+path = "fuzz_targets/store_model.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "recovery_state"
+path = "fuzz_targets/recovery_state.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "sub_tracking"
+path = "fuzz_targets/sub_tracking.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "batch_equivalence"
+path = "fuzz_targets/batch_equivalence.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "http_request"
+path = "fuzz_targets/http_request.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "frame_roundtrip"
+path = "fuzz_targets/frame_roundtrip.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "rate_limiter"
+path = "fuzz_targets/rate_limiter.rs"
 test = false
 doc = false
 bench = false

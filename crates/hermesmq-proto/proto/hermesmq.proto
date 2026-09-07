@@ -16,7 +16,14 @@ message Request {
     SetRateLimit set_rate_limit = 10;
     SetRetention set_retention = 11;
     Subscribe subscribe = 12;
+    Auth auth = 13;
   }
+}
+
+// Sent as the first request on a connection when the server is started with a
+// client token. Every other request is refused until it succeeds.
+message Auth {
+  string token = 1;
 }
 
 message Subscribe {

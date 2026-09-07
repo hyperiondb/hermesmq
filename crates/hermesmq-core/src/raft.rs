@@ -74,6 +74,16 @@ pub enum AppRequest {
         visibility_timeout_ms: u64,
         ts_ms: u64,
     },
+    // Appended, never reordered: these variants are postcard-encoded by index
+    // into the Raft log, so an existing entry must keep decoding as itself.
+    /// A commit that carries the leader's clock, so the consumer group it
+    /// creates is subject to the same idle expiry as one created by a poll.
+    CommitOffsetAt {
+        topic: TopicId,
+        group: GroupId,
+        offset: Offset,
+        ts_ms: u64,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -110,6 +120,8 @@ pub enum AppResponse {
     RetentionSet,
     NoOp,
     ProducedMany { offsets: Vec<Offset> },
+    /// The request was refused by the state machine because it broke a limit.
+    Rejected { reason: String },
 }
 
 openraft::declare_raft_types!(

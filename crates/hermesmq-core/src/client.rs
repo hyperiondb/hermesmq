@@ -12,7 +12,8 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, oneshot, Notify, Semaphore};
 
 use crate::engine::{HermesRaft, StateMachineStore};
-use crate::frame::{read_frame, write_frame, MAX_CLIENT_FRAME};
+use crate::frame::{read_frame_deadline, write_frame, BODY_TIMEOUT, MAX_CLIENT_FRAME};
+use crate::queue::{MAX_NAME_BYTES, MAX_PRODUCER_ID_BYTES, MAX_TOPICS, MAX_VISIBILITY_MS};
 use crate::raft::{AppRequest, AppResponse, Delivered, ProduceItem};
 use crate::types::{ContentType, GroupId, LeaseId, NodeId, Offset, Priority, TopicId};
 
@@ -21,9 +22,14 @@ const DEFAULT_POLL_MAX: u32 = 16;
 const MAX_POLL_MAX: u32 = 1024;
 const DEFAULT_VISIBILITY_MS: u64 = 30_000;
 const MAX_WAIT_MS: u64 = 300_000;
+/// A connection costs a task, a socket and a read buffer, so cap how many one
+/// listener will hold at once.
+const MAX_CLIENT_CONNS: usize = 4096;
 const MAX_PRIORITY: u32 = 7;
-const SUBSCRIBE_MAX_LEASE_REFRESHES: u32 = 2;
-const SUBSCRIBE_MAX_LEASE_ALIASES: usize = 8;
+#[doc(hidden)]
+pub const SUBSCRIBE_MAX_LEASE_REFRESHES: u32 = 2;
+#[doc(hidden)]
+pub const SUBSCRIBE_MAX_LEASE_ALIASES: usize = 8;
 const PIPELINE_DEPTH: usize = 32;
 const PRODUCE_QUEUE_DEPTH: usize = 1024;
 const PRODUCE_BATCH_MAX_ITEMS: usize = 256;
@@ -41,21 +47,24 @@ struct OffsetTrack {
     leases: Vec<LeaseId>,
 }
 
-enum Delivery {
+#[doc(hidden)]
+#[derive(Debug, PartialEq, Eq)]
+pub enum Delivery {
     Push,
     Refreshed,
     AlreadyAcked,
 }
 
+#[doc(hidden)]
 #[derive(Default)]
-struct SubTracking {
+pub struct SubTracking {
     by_offset: HashMap<Offset, OffsetTrack>,
     lease_to_offset: HashMap<LeaseId, Offset>,
     acked_recently: HashMap<Offset, u64>,
 }
 
 impl SubTracking {
-    fn deliver(&mut self, offset: Offset, lease_id: LeaseId, deadline_ms: u64, now_ms: u64) -> Delivery {
+    pub fn deliver(&mut self, offset: Offset, lease_id: LeaseId, deadline_ms: u64, now_ms: u64) -> Delivery {
         if let Some(until) = self.acked_recently.get(&offset) {
             if *until > now_ms {
                 return Delivery::AlreadyAcked;
@@ -96,7 +105,7 @@ impl SubTracking {
         }
     }
 
-    fn resolve(&mut self, lease_id: LeaseId, acked_until: Option<u64>) -> Option<LeaseId> {
+    pub fn resolve(&mut self, lease_id: LeaseId, acked_until: Option<u64>) -> Option<LeaseId> {
         let offset = self.lease_to_offset.get(&lease_id).copied()?;
         let track = self.by_offset.remove(&offset)?;
         for lease in &track.leases {
@@ -108,7 +117,7 @@ impl SubTracking {
         Some(track.lease_id)
     }
 
-    fn live_count(&mut self, now_ms: u64, grace_ms: u64) -> usize {
+    pub fn live_count(&mut self, now_ms: u64, grace_ms: u64) -> usize {
         self.acked_recently.retain(|_, until| *until > now_ms);
         let stale: Vec<Offset> = self
             .by_offset
@@ -128,6 +137,41 @@ impl SubTracking {
             .filter(|t| t.deadline_ms > now_ms)
             .count()
     }
+
+    /// Internal consistency check over the three maps, exposed for the fuzz targets.
+    #[doc(hidden)]
+    pub fn debug_check_invariants(&self) -> Result<(), String> {
+        for (lease, offset) in &self.lease_to_offset {
+            let Some(track) = self.by_offset.get(offset) else {
+                return Err(format!("lease {lease} points at unknown offset {offset}"));
+            };
+            if !track.leases.contains(lease) {
+                return Err(format!("offset {offset} does not list its alias lease {lease}"));
+            }
+        }
+        for (offset, track) in &self.by_offset {
+            if track.leases.len() > SUBSCRIBE_MAX_LEASE_ALIASES + 1 {
+                return Err(format!(
+                    "offset {offset} holds {} lease aliases",
+                    track.leases.len()
+                ));
+            }
+            if !track.leases.contains(&track.lease_id) {
+                return Err(format!("offset {offset} current lease is not in its alias list"));
+            }
+        }
+        Ok(())
+    }
+
+    /// Entry counts of the three maps, exposed for the fuzz targets.
+    #[doc(hidden)]
+    pub fn debug_sizes(&self) -> (usize, usize, usize) {
+        (
+            self.by_offset.len(),
+            self.lease_to_offset.len(),
+            self.acked_recently.len(),
+        )
+    }
 }
 
 struct Bucket {
@@ -135,20 +179,27 @@ struct Bucket {
     last: Instant,
 }
 
+#[doc(hidden)]
 #[derive(Default)]
-struct RateLimiter {
+pub struct RateLimiter {
     buckets: StdMutex<HashMap<String, Bucket>>,
 }
 
 impl RateLimiter {
-    fn take(
+    pub fn take(
         &self,
         topic: &str,
         rate_per_sec: f64,
         burst: f64,
         want: u32,
     ) -> std::result::Result<u32, u64> {
-        let mut buckets = self.buckets.lock().unwrap();
+        // Asking for nothing is granted, not rate limited: the rate-limited
+        // branch below would compute a zero retry delay and invite a caller to
+        // spin.
+        if want == 0 {
+            return Ok(0);
+        }
+        let mut buckets = crate::lock(&self.buckets);
         let now = Instant::now();
         let bucket = buckets.entry(topic.to_string()).or_insert(Bucket {
             tokens: burst,
@@ -171,18 +222,24 @@ impl RateLimiter {
         Ok(grant)
     }
 
-    fn refund(&self, topic: &str, amount: u32, burst: f64) {
+    pub fn refund(&self, topic: &str, amount: u32, burst: f64) {
         if amount == 0 {
             return;
         }
-        let mut buckets = self.buckets.lock().unwrap();
+        let mut buckets = crate::lock(&self.buckets);
         if let Some(bucket) = buckets.get_mut(topic) {
             bucket.tokens = (bucket.tokens + amount as f64).min(burst);
         }
     }
 
     fn forget(&self, topic: &str) {
-        self.buckets.lock().unwrap().remove(topic);
+        crate::lock(&self.buckets).remove(topic);
+    }
+
+    /// Current token count for a topic, exposed for the fuzz targets.
+    #[doc(hidden)]
+    pub fn debug_tokens(&self, topic: &str) -> Option<f64> {
+        crate::lock(&self.buckets).get(topic).map(|b| b.tokens)
     }
 }
 
@@ -211,7 +268,7 @@ struct Ctx {
 
 impl Ctx {
     fn notifier(&self, topic: &str) -> Arc<Notify> {
-        let mut map = self.notifiers.lock().unwrap();
+        let mut map = crate::lock(&self.notifiers);
         gc_notifiers(&mut map);
         map.entry(topic.to_string())
             .or_insert_with(|| Arc::new(Notify::new()))
@@ -335,10 +392,45 @@ fn app_response_to_proto(r: AppResponse) -> Response {
         | AppResponse::RateLimitSet
         | AppResponse::RetentionSet
         | AppResponse::NoOp => resp_ok(),
+        AppResponse::Rejected { reason } => resp_error("rejected", reason),
         AppResponse::ProducedMany { .. } => {
             resp_error("internal", "unexpected batched produce response".to_string())
         }
     }
+}
+
+fn check_len(kind: &str, value: &str, max: usize) -> Result<(), Response> {
+    if value.len() > max {
+        return Err(resp_error(
+            "bad_request",
+            format!("{kind} is {} bytes; max is {max}", value.len()),
+        ));
+    }
+    Ok(())
+}
+
+/// Turn away a request whose names the state machine would refuse anyway, so a
+/// bad one costs a reply instead of a replicated write.
+fn check_names(topic: &str, group: &str) -> Option<Response> {
+    check_len("topic name", topic, MAX_NAME_BYTES)
+        .and_then(|()| check_len("group name", group, MAX_NAME_BYTES))
+        .err()
+}
+
+/// [`check_names`] plus the topic limit, for the requests that can create one.
+/// Poll, commit, ack and nack are not among them: they only ever look a topic
+/// up, so they pay for the name check alone.
+fn check_new_topic(ctx: &Ctx, topic: &str) -> Option<Response> {
+    if let Some(resp) = check_names(topic, "") {
+        return Some(resp);
+    }
+    if !ctx.sm.topic_admits(topic) {
+        return Some(resp_error(
+            "rejected",
+            format!("topic limit of {MAX_TOPICS} reached"),
+        ));
+    }
+    None
 }
 
 async fn write_and_map(raft: &HermesRaft, app: AppRequest) -> Response {
@@ -367,6 +459,12 @@ async fn handle_produce(ctx: &Ctx, p: proto::Produce) -> Response {
             "payload_too_large",
             format!("payload is {} bytes; max is {MAX_PAYLOAD_BYTES}", p.payload.len()),
         );
+    }
+    if let Err(resp) = check_len("producer id", &p.producer_id, MAX_PRODUCER_ID_BYTES) {
+        return resp;
+    }
+    if let Some(resp) = check_new_topic(ctx, &p.topic) {
+        return resp;
     }
     let (reply, reply_rx) = oneshot::channel();
     if ctx.produce_tx.send(ProduceJob { p, reply }).await.is_err() {
@@ -439,7 +537,7 @@ async fn write_produce_batch(
                         kind: Some(response::Kind::Produced(proto::Produced { offset })),
                     });
                 }
-                let map = notifiers.lock().unwrap();
+                let map = crate::lock(notifiers);
                 for topic in &topics {
                     if let Some(notifier) = map.get(topic) {
                         notifier.notify_waiters();
@@ -523,7 +621,7 @@ async fn write_ack_groups(
             let _ = reply.send(resp.clone());
         }
         if nack && ok {
-            if let Some(notifier) = notifiers.lock().unwrap().get(&topic) {
+            if let Some(notifier) = crate::lock(notifiers).get(&topic) {
                 notifier.notify_waiters();
             }
         }
@@ -540,13 +638,16 @@ async fn handle_poll(ctx: &Ctx, p: proto::Poll) -> Response {
         return resp_not_leader(leader_addr(&ctx.raft));
     }
 
+    if let Some(resp) = check_names(&p.topic, &p.group) {
+        return resp;
+    }
     let topic = TopicId(p.topic.clone());
     let group = GroupId(p.group.clone());
     let max = if p.max == 0 { DEFAULT_POLL_MAX } else { p.max.min(MAX_POLL_MAX) };
     let visibility = if p.visibility_timeout_ms == 0 {
         DEFAULT_VISIBILITY_MS
     } else {
-        p.visibility_timeout_ms
+        p.visibility_timeout_ms.min(MAX_VISIBILITY_MS)
     };
     let wait_ms = p.wait_ms.min(MAX_WAIT_MS);
     let deadline = Instant::now() + Duration::from_millis(wait_ms);
@@ -685,7 +786,11 @@ async fn handle_request(ctx: &Ctx, req: Request) -> Response {
         request::Kind::Stats(_) => stats_response(raft, &ctx.sm),
         request::Kind::Produce(p) => handle_produce(ctx, p).await,
         request::Kind::Poll(p) => handle_poll(ctx, p).await,
+        request::Kind::Auth(_) => resp_ok(),
         request::Kind::SetRateLimit(s) => {
+            if let Some(resp) = check_new_topic(ctx, &s.topic) {
+                return resp;
+            }
             write_and_map(
                 raft,
                 AppRequest::SetRateLimit {
@@ -697,6 +802,9 @@ async fn handle_request(ctx: &Ctx, req: Request) -> Response {
             .await
         }
         request::Kind::SetRetention(s) => {
+            if let Some(resp) = check_new_topic(ctx, &s.topic) {
+                return resp;
+            }
             write_and_map(
                 raft,
                 AppRequest::SetRetention {
@@ -707,27 +815,44 @@ async fn handle_request(ctx: &Ctx, req: Request) -> Response {
             )
             .await
         }
-        request::Kind::Ack(a) => enqueue_ack(ctx, a.topic, a.group, a.lease_id, false).await,
-        request::Kind::Nack(a) => enqueue_ack(ctx, a.topic, a.group, a.lease_id, true).await,
+        request::Kind::Ack(a) => {
+            if let Some(resp) = check_names(&a.topic, &a.group) {
+                return resp;
+            }
+            enqueue_ack(ctx, a.topic, a.group, a.lease_id, false).await
+        }
+        request::Kind::Nack(a) => {
+            if let Some(resp) = check_names(&a.topic, &a.group) {
+                return resp;
+            }
+            enqueue_ack(ctx, a.topic, a.group, a.lease_id, true).await
+        }
         request::Kind::Commit(c) => {
+            if let Some(resp) = check_names(&c.topic, &c.group) {
+                return resp;
+            }
             write_and_map(
                 raft,
-                AppRequest::CommitOffset {
+                AppRequest::CommitOffsetAt {
                     topic: TopicId(c.topic),
                     group: GroupId(c.group),
                     offset: c.offset,
+                    ts_ms: now_ms(),
                 },
             )
             .await
         }
         request::Kind::CreateTopic(c) => {
+            if let Some(resp) = check_new_topic(ctx, &c.topic) {
+                return resp;
+            }
             write_and_map(raft, AppRequest::CreateTopic { topic: TopicId(c.topic) }).await
         }
         request::Kind::DeleteTopic(c) => {
             let topic = c.topic.clone();
             let resp = write_and_map(raft, AppRequest::DeleteTopic { topic: TopicId(c.topic) }).await;
             if matches!(resp.kind, Some(response::Kind::Ok(_))) {
-                ctx.notifiers.lock().unwrap().remove(&topic);
+                crate::lock(&ctx.notifiers).remove(&topic);
                 ctx.limiter.forget(&topic);
             }
             resp
@@ -755,6 +880,10 @@ async fn handle_subscribe(
         return Ok(());
     }
 
+    if let Some(resp) = check_names(&sub.topic, &sub.group) {
+        write_frame(&mut write_half, &resp.encode_to_vec()).await?;
+        return Ok(());
+    }
     let topic = TopicId(sub.topic.clone());
     let group = GroupId(sub.group.clone());
     let prefetch = sub.prefetch.clamp(1, MAX_POLL_MAX) as usize;
@@ -762,7 +891,7 @@ async fn handle_subscribe(
     let visibility = if sub.visibility_timeout_ms == 0 {
         DEFAULT_VISIBILITY_MS
     } else {
-        sub.visibility_timeout_ms
+        sub.visibility_timeout_ms.min(MAX_VISIBILITY_MS)
     };
 
     let tracking: Arc<StdMutex<SubTracking>> = Arc::new(StdMutex::new(SubTracking::default()));
@@ -778,10 +907,11 @@ async fn handle_subscribe(
         let closed = closed.clone();
         tokio::spawn(async move {
             loop {
-                let bytes = match read_frame(&mut read_half, MAX_CLIENT_FRAME).await {
-                    Ok(b) => b,
-                    Err(_) => break,
-                };
+                let bytes =
+                    match read_frame_deadline(&mut read_half, MAX_CLIENT_FRAME, BODY_TIMEOUT).await {
+                        Ok(b) => b,
+                        Err(_) => break,
+                    };
                 if auto {
                     continue;
                 }
@@ -791,10 +921,7 @@ async fn handle_subscribe(
                 match req.kind {
                     Some(request::Kind::Ack(a)) => {
                         let acked_until = now_ms().saturating_add(ACK_GRACE_MS);
-                        let resolved = tracking
-                            .lock()
-                            .unwrap()
-                            .resolve(a.lease_id, Some(acked_until));
+                        let resolved = crate::lock(&tracking).resolve(a.lease_id, Some(acked_until));
                         let _ = ctx
                             .ack_tx
                             .send(AckJob {
@@ -810,7 +937,7 @@ async fn handle_subscribe(
                         }
                     }
                     Some(request::Kind::Nack(a)) => {
-                        let resolved = tracking.lock().unwrap().resolve(a.lease_id, None);
+                        let resolved = crate::lock(&tracking).resolve(a.lease_id, None);
                         let _ = ctx
                             .ack_tx
                             .send(AckJob {
@@ -850,7 +977,7 @@ async fn handle_subscribe(
         tokio::pin!(notified);
         notified.as_mut().enable();
 
-        let cur = tracking.lock().unwrap().live_count(now_ms(), visibility);
+        let cur = crate::lock(&tracking).live_count(now_ms(), visibility);
         let mut pushed_any = false;
         if cur < prefetch && ctx.sm.has_deliverable(&sub.topic, &sub.group, now_ms()) {
             let want = (prefetch - cur) as u32;
@@ -895,10 +1022,8 @@ async fn handle_subscribe(
                                 if !auto {
                                     let now = now_ms();
                                     let deadline = now.saturating_add(visibility);
-                                    let delivery = tracking
-                                        .lock()
-                                        .unwrap()
-                                        .deliver(d.offset, d.lease_id, deadline, now);
+                                    let delivery =
+                                        crate::lock(&tracking).deliver(d.offset, d.lease_id, deadline, now);
                                     match delivery {
                                         Delivery::Refreshed => continue,
                                         Delivery::AlreadyAcked => {
@@ -947,7 +1072,26 @@ async fn handle_subscribe(
     Ok(())
 }
 
+/// Serve the client port with no authentication: anyone who can open it can
+/// produce, consume, reconfigure topics and bootstrap an un-bootstrapped node.
 pub async fn serve_clients(raft: HermesRaft, sm: StateMachineStore, listener: TcpListener) {
+    serve_clients_authenticated(raft, sm, listener, None).await
+}
+
+/// Serve the client port, requiring `token` when one is set. A connection must
+/// send a matching `Auth` request before any other request is served.
+pub async fn serve_clients_authenticated(
+    raft: HermesRaft,
+    sm: StateMachineStore,
+    listener: TcpListener,
+    token: Option<String>,
+) {
+    if token.is_none() {
+        tracing::warn!(
+            "client port has no token: any host that can reach it can read, write and reconfigure"
+        );
+    }
+    let token = Arc::new(token);
     let notifiers: Arc<StdMutex<HashMap<String, Arc<Notify>>>> =
         Arc::new(StdMutex::new(HashMap::new()));
     let (produce_tx, produce_rx) = mpsc::channel(PRODUCE_QUEUE_DEPTH);
@@ -962,15 +1106,24 @@ pub async fn serve_clients(raft: HermesRaft, sm: StateMachineStore, listener: Tc
         produce_tx,
         ack_tx,
     };
+    let permits = Arc::new(Semaphore::new(MAX_CLIENT_CONNS));
     loop {
         match listener.accept().await {
-            Ok((stream, _)) => {
+            Ok((stream, addr)) => {
+                let Ok(permit) = permits.clone().try_acquire_owned() else {
+                    tracing::warn!(
+                        "client connection from {addr} refused: {MAX_CLIENT_CONNS} already open"
+                    );
+                    continue;
+                };
                 let _ = stream.set_nodelay(true);
                 let ctx = ctx.clone();
+                let token = token.clone();
                 tokio::spawn(async move {
-                    if let Err(e) = handle_client(ctx, stream).await {
+                    if let Err(e) = handle_client(ctx, stream, token.as_ref().as_deref()).await {
                         tracing::debug!("client connection closed: {e}");
                     }
+                    drop(permit);
                 });
             }
             Err(e) => tracing::warn!("client accept error: {e}"),
@@ -978,9 +1131,10 @@ pub async fn serve_clients(raft: HermesRaft, sm: StateMachineStore, listener: Tc
     }
 }
 
-async fn handle_client(ctx: Ctx, stream: TcpStream) -> io::Result<()> {
+async fn handle_client(ctx: Ctx, stream: TcpStream, token: Option<&str>) -> io::Result<()> {
     let (mut read_half, write_half) = stream.into_split();
     let (tx, mut rx) = mpsc::channel::<oneshot::Receiver<Response>>(PIPELINE_DEPTH);
+    let mut authed = token.is_none();
 
     let writer = tokio::spawn(async move {
         let mut write_half = write_half;
@@ -996,7 +1150,7 @@ async fn handle_client(ctx: Ctx, stream: TcpStream) -> io::Result<()> {
     });
 
     let sub = loop {
-        let bytes = match read_frame(&mut read_half, MAX_CLIENT_FRAME).await {
+        let bytes = match read_frame_deadline(&mut read_half, MAX_CLIENT_FRAME, BODY_TIMEOUT).await {
             Ok(b) => b,
             Err(_) => break None,
         };
@@ -1011,6 +1165,31 @@ async fn handle_client(ctx: Ctx, stream: TcpStream) -> io::Result<()> {
                 continue;
             }
         };
+        if !authed {
+            // One chance per connection: a wrong or missing token answers once
+            // and the connection closes, so guessing costs a new handshake.
+            let offered = match &req.kind {
+                Some(request::Kind::Auth(a)) => Some(a.token.as_str()),
+                _ => None,
+            };
+            let ok = offered.is_some_and(|offered| {
+                token.is_some_and(|expected| {
+                    crate::secret_eq(offered.as_bytes(), expected.as_bytes())
+                })
+            });
+            let (otx, orx) = oneshot::channel();
+            let _ = otx.send(if ok {
+                resp_ok()
+            } else {
+                resp_error("unauthorized", "authenticate first".to_string())
+            });
+            let _ = tx.send(orx).await;
+            if !ok {
+                break None;
+            }
+            authed = true;
+            continue;
+        }
         if let Some(request::Kind::Subscribe(sub)) = req.kind {
             break Some(sub);
         }
@@ -1037,6 +1216,25 @@ async fn handle_client(ctx: Ctx, stream: TcpStream) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_request_for_zero_tokens_is_granted_not_rate_limited() {
+        let limiter = RateLimiter::default();
+        assert_eq!(
+            limiter.take("t", 10.0, 100.0, 0),
+            Ok(0),
+            "asking for nothing must not answer with a zero retry delay"
+        );
+        assert_eq!(limiter.take("t", 10.0, 100.0, 1), Ok(1));
+    }
+
+    #[test]
+    fn secret_eq_matches_only_the_same_bytes() {
+        assert!(crate::secret_eq(b"token", b"token"));
+        assert!(!crate::secret_eq(b"token", b"tokeN"));
+        assert!(!crate::secret_eq(b"token", b"token "));
+        assert!(!crate::secret_eq(b"", b"token"));
+    }
 
     #[test]
     fn gc_notifiers_drops_entries_without_waiters() {

@@ -3,7 +3,10 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use clap::Parser;
-use hermesmq_core::{build_raft, serve_clients, serve_http, serve_peer, RedbStore};
+use hermesmq_core::{
+    build_raft_authenticated, serve_clients_authenticated, serve_http, serve_peer_authenticated,
+    RedbStore,
+};
 use tokio::net::TcpListener;
 
 #[derive(Parser, Debug)]
@@ -31,6 +34,16 @@ struct Cli {
         action = clap::ArgAction::Set
     )]
     metrics_enabled: bool,
+
+    /// Shared secret every client connection must present before it is served.
+    /// Unset leaves the client port open to anyone who can reach it.
+    #[arg(long, env = "HERMESMQ_CLIENT_TOKEN")]
+    client_token: Option<String>,
+
+    /// Shared secret every peer connection must present, in both directions.
+    /// Set the same value on every node in the cluster.
+    #[arg(long, env = "HERMESMQ_PEER_TOKEN")]
+    peer_token: Option<String>,
 }
 
 #[cfg(unix)]
@@ -58,12 +71,16 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let cli = Cli::parse();
+    // A variable a compose file leaves unset arrives as an empty string,
+    // which must mean "no token", not "the empty token".
+    let client_token = cli.client_token.clone().filter(|t| !t.is_empty());
+    let peer_token = cli.peer_token.clone().filter(|t| !t.is_empty());
 
     std::fs::create_dir_all(&cli.data_dir)?;
     let db_path = cli.data_dir.join("hermesmq.redb");
     let db = Arc::new(RedbStore::open(&db_path)?);
 
-    let (raft, sm) = build_raft(cli.node_id, db)
+    let (raft, sm) = build_raft_authenticated(cli.node_id, db, peer_token.clone())
         .await
         .map_err(|e| anyhow::anyhow!(e))?;
 
@@ -76,12 +93,23 @@ async fn main() -> anyhow::Result<()> {
         client = %cli.client_addr,
         metrics = %cli.metrics_addr,
         metrics_enabled = cli.metrics_enabled,
+        client_auth = client_token.is_some(),
+        peer_auth = peer_token.is_some(),
         data_dir = %cli.data_dir.display(),
         "hermesmqd listening (waiting for client bootstrap)"
     );
 
-    tokio::spawn(serve_peer(raft.clone(), peer_listener));
-    tokio::spawn(serve_clients(raft.clone(), sm.clone(), client_listener));
+    tokio::spawn(serve_peer_authenticated(
+        raft.clone(),
+        peer_listener,
+        peer_token,
+    ));
+    tokio::spawn(serve_clients_authenticated(
+        raft.clone(),
+        sm.clone(),
+        client_listener,
+        client_token,
+    ));
     tokio::spawn(serve_http(raft.clone(), sm, metrics_listener, cli.metrics_enabled));
 
     shutdown_signal().await?;

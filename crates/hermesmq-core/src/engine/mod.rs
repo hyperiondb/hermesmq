@@ -9,8 +9,17 @@ use openraft::{BasicNode, Config, LogId, Raft, StorageError, StorageIOError};
 use serde::de::DeserializeOwned;
 
 pub use log_store::LogStore;
-pub use network::{serve_peer, PartitionControl, PeerConnection, PeerNetwork};
+pub use network::{
+    serve_peer, serve_peer_authenticated, PartitionControl, PeerConnection, PeerNetwork,
+};
 pub use state_machine::{SnapshotBuilder, StateMachineStore};
+
+#[doc(hidden)]
+pub use log_store::KEY_PURGED;
+#[doc(hidden)]
+pub use network::{fuzz_decode_peer_request, fuzz_decode_peer_response};
+#[doc(hidden)]
+pub use state_machine::{fuzz_decode_state, fuzz_store_snapshot, KEY_SNAPSHOT};
 
 use crate::raft::TypeConfig;
 use crate::storage::Storage;
@@ -89,6 +98,18 @@ fn recover_consistency<S: Storage>(db: &S) -> crate::Result<()> {
     Ok(())
 }
 
+/// [`recover_consistency`] on its own, exposed for the fuzz targets.
+#[doc(hidden)]
+pub fn fuzz_recover_consistency<S: Storage>(db: &S) -> crate::Result<()> {
+    recover_consistency(db)
+}
+
+/// The highest log index the persisted snapshot covers, exposed for the fuzz targets.
+#[doc(hidden)]
+pub fn fuzz_snapshot_last_index<S: Storage>(db: &S) -> crate::Result<Option<u64>> {
+    state_machine::snapshot_last_index(db).map_err(|e| crate::Error::Storage(e.to_string()))
+}
+
 /// openraft's snapshot defaults (`install_snapshot_timeout` 200ms,
 /// `snapshot_max_chunk_size` 3 MiB) ship a multi-megabyte snapshot as a *single*
 /// chunk with a 200ms RPC deadline. On a real network — a container/overlay link
@@ -105,6 +126,17 @@ pub async fn build_raft_partitionable<S: Storage>(
     db: Arc<S>,
 ) -> Result<(HermesRaft, StateMachineStore<S>, PartitionControl), Box<dyn std::error::Error + Send + Sync>>
 {
+    build_raft_partitionable_authenticated(node_id, db, None).await
+}
+
+/// [`build_raft_partitionable`] whose outgoing peer connections present
+/// `peer_token`. Pair it with [`serve_peer_authenticated`] using the same token.
+pub async fn build_raft_partitionable_authenticated<S: Storage>(
+    node_id: NodeId,
+    db: Arc<S>,
+    peer_token: Option<String>,
+) -> Result<(HermesRaft, StateMachineStore<S>, PartitionControl), Box<dyn std::error::Error + Send + Sync>>
+{
     recover_consistency(db.as_ref())?;
     let config = Arc::new(Config {
         heartbeat_interval: 300,
@@ -119,7 +151,7 @@ pub async fn build_raft_partitionable<S: Storage>(
     let log = LogStore::new(db.clone());
     let state_machine = StateMachineStore::new(db)?;
     let sm_read = state_machine.clone();
-    let network = PeerNetwork::default();
+    let network = PeerNetwork::with_token(peer_token);
     let blocked = network.blocked_handle();
     let raft = Raft::new(node_id, config, network, log, state_machine).await?;
     Ok((raft, sm_read, blocked))
@@ -130,6 +162,17 @@ pub async fn build_raft<S: Storage>(
     db: Arc<S>,
 ) -> Result<(HermesRaft, StateMachineStore<S>), Box<dyn std::error::Error + Send + Sync>> {
     let (raft, sm, _blocked) = build_raft_partitionable(node_id, db).await?;
+    Ok((raft, sm))
+}
+
+/// [`build_raft`] whose outgoing peer connections present `peer_token`.
+pub async fn build_raft_authenticated<S: Storage>(
+    node_id: NodeId,
+    db: Arc<S>,
+    peer_token: Option<String>,
+) -> Result<(HermesRaft, StateMachineStore<S>), Box<dyn std::error::Error + Send + Sync>> {
+    let (raft, sm, _blocked) =
+        build_raft_partitionable_authenticated(node_id, db, peer_token).await?;
     Ok((raft, sm))
 }
 

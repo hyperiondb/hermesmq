@@ -1,10 +1,16 @@
 use std::io;
+use std::sync::Arc;
+use std::time::Duration;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::Semaphore;
 
 use crate::engine::HermesRaft;
 use crate::engine::StateMachineStore;
+
+const MAX_HTTP_CONNS: usize = 256;
+const HEAD_TIMEOUT: Duration = Duration::from_secs(10);
 
 pub async fn serve_http(
     raft: HermesRaft,
@@ -12,15 +18,21 @@ pub async fn serve_http(
     listener: TcpListener,
     metrics_enabled: bool,
 ) {
+    let permits = Arc::new(Semaphore::new(MAX_HTTP_CONNS));
     loop {
         match listener.accept().await {
-            Ok((stream, _)) => {
+            Ok((stream, addr)) => {
+                let Ok(permit) = permits.clone().try_acquire_owned() else {
+                    tracing::warn!("http connection from {addr} refused: {MAX_HTTP_CONNS} already open");
+                    continue;
+                };
                 let raft = raft.clone();
                 let sm = sm.clone();
                 tokio::spawn(async move {
                     if let Err(e) = handle(raft, sm, stream, metrics_enabled).await {
                         tracing::debug!("http connection closed: {e}");
                     }
+                    drop(permit);
                 });
             }
             Err(e) => tracing::warn!("http accept error: {e}"),
@@ -34,6 +46,29 @@ async fn handle(
     mut stream: TcpStream,
     metrics_enabled: bool,
 ) -> io::Result<()> {
+    let buf = match tokio::time::timeout(HEAD_TIMEOUT, read_head(&mut stream)).await {
+        Ok(res) => res?,
+        Err(_) => {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "request head did not arrive before the deadline",
+            ))
+        }
+    };
+    let path = parse_path(&buf);
+
+    let (status, content_type, body) = route(&raft, &sm, &path, metrics_enabled);
+    let response = format!(
+        "HTTP/1.1 {status}\r\ncontent-type: {content_type}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    stream.write_all(response.as_bytes()).await?;
+    stream.flush().await?;
+    Ok(())
+}
+
+/// Read up to the end of the first request line, or 8 KiB, whichever comes first.
+async fn read_head(stream: &mut TcpStream) -> io::Result<Vec<u8>> {
     let mut buf = Vec::with_capacity(1024);
     let mut chunk = [0u8; 1024];
     loop {
@@ -46,25 +81,22 @@ async fn handle(
             break;
         }
     }
-    let head = String::from_utf8_lossy(&buf);
+    Ok(buf)
+}
+
+/// Pull the request path out of an HTTP request head.
+#[doc(hidden)]
+pub fn parse_path(head: &[u8]) -> String {
+    let head = String::from_utf8_lossy(head);
     let request_line = head.lines().next().unwrap_or("");
-    let path = request_line
+    request_line
         .split_whitespace()
         .nth(1)
         .unwrap_or("/")
         .split('?')
         .next()
         .unwrap_or("/")
-        .to_string();
-
-    let (status, content_type, body) = route(&raft, &sm, &path, metrics_enabled);
-    let response = format!(
-        "HTTP/1.1 {status}\r\ncontent-type: {content_type}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
-        body.len()
-    );
-    stream.write_all(response.as_bytes()).await?;
-    stream.flush().await?;
-    Ok(())
+        .to_string()
 }
 
 fn route(

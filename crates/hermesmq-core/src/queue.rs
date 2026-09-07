@@ -12,6 +12,34 @@ const DEFAULT_RETAIN_MAX_MESSAGES: u64 = 1_000_000;
 const GROUP_GC_THRESHOLD: usize = 1024;
 const GROUP_IDLE_EXPIRE_MS: u64 = 7 * 24 * 60 * 60 * 1000;
 
+/// Bounds on what one request can add to the replicated state. They are
+/// compiled-in rather than configured because every replica must reach the same
+/// decision for the same request.
+pub const MAX_NAME_BYTES: usize = 256;
+pub const MAX_PRODUCER_ID_BYTES: usize = 256;
+pub const MAX_TOPICS: usize = 10_000;
+pub const MAX_GROUPS_PER_TOPIC: usize = 1_000;
+pub const MAX_VISIBILITY_MS: u64 = 12 * 60 * 60 * 1000;
+
+/// Ceiling for every counter a snapshot can set. Well below `u64::MAX`, so the
+/// increments below cannot reach the top of the range from a validated state.
+const MAX_COUNTER: u64 = 1 << 62;
+
+fn check_consumer(topic: &str, group: &str) -> Result<(), String> {
+    check_name("topic", topic)?;
+    check_name("group", group)
+}
+
+fn check_name(kind: &str, name: &str) -> Result<(), String> {
+    if name.len() > MAX_NAME_BYTES {
+        return Err(format!(
+            "{kind} name is {} bytes; max is {MAX_NAME_BYTES}",
+            name.len()
+        ));
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct Lease {
     offset: Offset,
@@ -35,7 +63,7 @@ impl GroupState {
         }
         self.acked_above.insert(offset);
         while self.acked_above.remove(&self.ack_watermark) {
-            self.ack_watermark += 1;
+            self.ack_watermark = self.ack_watermark.saturating_add(1);
         }
     }
 
@@ -71,7 +99,7 @@ impl GroupState {
             }
         }
         while self.acked_above.remove(&self.ack_watermark) {
-            self.ack_watermark += 1;
+            self.ack_watermark = self.ack_watermark.saturating_add(1);
         }
     }
 }
@@ -99,6 +127,9 @@ impl Queue {
     pub fn apply(&mut self, req: AppRequest) -> AppResponse {
         match req {
             AppRequest::CreateTopic { topic } => {
+                if let Err(reason) = self.check_topic(&topic.0) {
+                    return AppResponse::Rejected { reason };
+                }
                 self.topics.entry(topic.0).or_default();
                 AppResponse::TopicCreated
             }
@@ -115,7 +146,7 @@ impl Queue {
                 seq,
                 ts_ms,
             } => {
-                let offset = self.produce_one(ProduceItem {
+                let item = ProduceItem {
                     topic,
                     priority,
                     content_type,
@@ -123,10 +154,17 @@ impl Queue {
                     producer_id,
                     seq,
                     ts_ms,
-                });
+                };
+                if let Err(reason) = self.check_produce(std::slice::from_ref(&item)) {
+                    return AppResponse::Rejected { reason };
+                }
+                let offset = self.produce_one(item);
                 AppResponse::Produced { offset }
             }
             AppRequest::ProduceMany { items } => {
+                if let Err(reason) = self.check_produce(&items) {
+                    return AppResponse::Rejected { reason };
+                }
                 let offsets = items.into_iter().map(|item| self.produce_one(item)).collect();
                 AppResponse::ProducedMany { offsets }
             }
@@ -137,6 +175,9 @@ impl Queue {
                 visibility_timeout_ms,
                 ts_ms,
             } => {
+                if let Err(reason) = check_consumer(&topic.0, &group.0) {
+                    return AppResponse::Rejected { reason };
+                }
                 let mut next_lease = self.next_lease_id;
                 let items = poll(
                     &mut self.topics,
@@ -157,6 +198,9 @@ impl Queue {
                 visibility_timeout_ms,
                 ts_ms,
             } => {
+                if let Err(reason) = check_consumer(&topic.0, &group.0) {
+                    return AppResponse::Rejected { reason };
+                }
                 let mut next_lease = self.next_lease_id;
                 let items = poll(
                     &mut self.topics,
@@ -217,7 +261,23 @@ impl Queue {
                 group,
                 offset,
             } => {
-                commit(&mut self.topics, &topic.0, &group.0, offset);
+                if let Err(reason) = check_consumer(&topic.0, &group.0) {
+                    return AppResponse::Rejected { reason };
+                }
+                commit(&mut self.topics, &topic.0, &group.0, offset, None);
+                reclaim_topic(&mut self.topics, &topic.0);
+                AppResponse::Committed
+            }
+            AppRequest::CommitOffsetAt {
+                topic,
+                group,
+                offset,
+                ts_ms,
+            } => {
+                if let Err(reason) = check_consumer(&topic.0, &group.0) {
+                    return AppResponse::Rejected { reason };
+                }
+                commit(&mut self.topics, &topic.0, &group.0, offset, Some(ts_ms));
                 reclaim_topic(&mut self.topics, &topic.0);
                 AppResponse::Committed
             }
@@ -226,6 +286,9 @@ impl Queue {
                 rate_milli_per_sec,
                 burst,
             } => {
+                if let Err(reason) = self.check_topic(&topic.0) {
+                    return AppResponse::Rejected { reason };
+                }
                 let t = self.topics.entry(topic.0).or_default();
                 t.rate_milli_per_sec = rate_milli_per_sec;
                 t.burst = burst;
@@ -236,6 +299,9 @@ impl Queue {
                 max_messages,
                 max_age_ms,
             } => {
+                if let Err(reason) = self.check_topic(&topic.0) {
+                    return AppResponse::Rejected { reason };
+                }
                 let t = self.topics.entry(topic.0).or_default();
                 t.retain_max_messages = max_messages;
                 t.retain_max_age_ms = max_age_ms;
@@ -244,16 +310,50 @@ impl Queue {
         }
     }
 
+    /// Name and capacity checks for a produce, run over the whole batch before
+    /// any of it is applied so a rejected batch leaves no partial state.
+    fn check_produce(&self, items: &[ProduceItem]) -> Result<(), String> {
+        let mut fresh: BTreeSet<&str> = BTreeSet::new();
+        for item in items {
+            check_name("topic", &item.topic.0)?;
+            if item.producer_id.len() > MAX_PRODUCER_ID_BYTES {
+                return Err(format!(
+                    "producer id is {} bytes; max is {MAX_PRODUCER_ID_BYTES}",
+                    item.producer_id.len()
+                ));
+            }
+            if !self.topics.contains_key(&item.topic.0) {
+                fresh.insert(item.topic.0.as_str());
+            }
+        }
+        if self.topics.len() + fresh.len() > MAX_TOPICS {
+            return Err(format!("topic limit of {MAX_TOPICS} reached"));
+        }
+        Ok(())
+    }
+
+    /// Name and capacity checks for a request that may create one topic.
+    fn check_topic(&self, topic: &str) -> Result<(), String> {
+        check_name("topic", topic)?;
+        if !self.topics.contains_key(topic) && self.topics.len() >= MAX_TOPICS {
+            return Err(format!("topic limit of {MAX_TOPICS} reached"));
+        }
+        Ok(())
+    }
+
     fn produce_one(&mut self, item: ProduceItem) -> Offset {
         let t = self.topics.entry(item.topic.0).or_default();
         let dedup = !item.producer_id.is_empty();
         if dedup {
-            if let Some(offset) = t.dedup.get(&(item.producer_id.clone(), item.seq)) {
-                return *offset;
+            if let Some(offset) = t.dedup.get(&(item.producer_id.clone(), item.seq)).copied() {
+                // Retention runs on the duplicate too, so a producer that only
+                // re-sends cannot hold a topic above its cap.
+                purge_retained(t, item.ts_ms);
+                return offset;
             }
         }
         let offset = t.next_offset;
-        t.next_offset += 1;
+        t.next_offset = t.next_offset.saturating_add(1);
         t.messages.insert(
             offset,
             Message {
@@ -276,6 +376,12 @@ impl Queue {
         }
         purge_retained(t, item.ts_ms);
         offset
+    }
+
+    /// Whether a request naming this topic can proceed: either the topic is
+    /// already there, or there is room for one more.
+    pub fn topic_admits(&self, topic: &str) -> bool {
+        self.topics.contains_key(topic) || self.topics.len() < MAX_TOPICS
     }
 
     pub fn rate_config(&self, topic: &str) -> Option<(u64, u32)> {
@@ -317,6 +423,186 @@ impl Queue {
         }
         metrics
     }
+
+    /// Bring a decoded state back inside the range ordinary operation now keeps
+    /// it in, for the one shape earlier releases could produce themselves.
+    ///
+    /// Before commits were clamped, a client could commit any offset and park a
+    /// group's watermark past the end of its topic. Lowering it back to
+    /// `next_offset` is where those groups would have been left had the commit
+    /// been clamped, and it costs nothing: there are no messages up there.
+    /// Everything else [`Queue::validate`] rejects is damage, not history.
+    pub fn normalize(&mut self) {
+        for t in self.topics.values_mut() {
+            for g in t.groups.values_mut() {
+                if g.ack_watermark > t.next_offset {
+                    g.ack_watermark = t.next_offset;
+                }
+            }
+        }
+    }
+
+    /// Whether a decoded state is one the queue could have produced itself.
+    ///
+    /// Snapshot bytes reach the decoder from the peer port and from the record
+    /// on disk, and the decoded state replaces the whole queue, so a state that
+    /// breaks one of these is what makes counters wrap, dedup entries become
+    /// un-evictable, or messages become invisible.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.next_lease_id > MAX_COUNTER {
+            return Err(format!("next_lease_id is {}", self.next_lease_id));
+        }
+        for (name, t) in &self.topics {
+            if t.next_offset > MAX_COUNTER {
+                return Err(format!("topic {name}: next_offset is {}", t.next_offset));
+            }
+            for (offset, message) in &t.messages {
+                if message.offset != *offset {
+                    return Err(format!(
+                        "topic {name}: message stored at {offset} carries offset {}",
+                        message.offset
+                    ));
+                }
+            }
+            if let Some(highest) = t.messages.keys().next_back() {
+                if *highest >= t.next_offset {
+                    return Err(format!(
+                        "topic {name}: message offset {highest} is at or above next_offset {}",
+                        t.next_offset
+                    ));
+                }
+            }
+            if t.dedup.len() != t.dedup_order.len() {
+                return Err(format!(
+                    "topic {name}: dedup has {} entries but dedup_order has {}",
+                    t.dedup.len(),
+                    t.dedup_order.len()
+                ));
+            }
+            if t.dedup.len() > DEDUP_CAPACITY {
+                return Err(format!("topic {name}: dedup holds {} entries", t.dedup.len()));
+            }
+            let distinct: BTreeSet<&(String, u64)> = t.dedup_order.iter().collect();
+            if distinct.len() != t.dedup_order.len() {
+                return Err(format!("topic {name}: dedup_order holds a duplicate key"));
+            }
+            for key in &t.dedup_order {
+                if !t.dedup.contains_key(key) {
+                    return Err(format!("topic {name}: dedup_order key is missing from dedup"));
+                }
+            }
+            for (group, g) in &t.groups {
+                if g.poll_count > MAX_COUNTER {
+                    return Err(format!("topic {name} group {group}: poll_count is {}", g.poll_count));
+                }
+                if g.ack_watermark > t.next_offset {
+                    return Err(format!(
+                        "topic {name} group {group}: watermark {} is above next_offset {}",
+                        g.ack_watermark, t.next_offset
+                    ));
+                }
+                if let Some(highest) = g.acked_above.iter().next_back() {
+                    if *highest >= t.next_offset {
+                        return Err(format!(
+                            "topic {name} group {group}: acked_above holds {highest} at or above next_offset {}",
+                            t.next_offset
+                        ));
+                    }
+                }
+                for (lease_id, lease) in &g.in_flight {
+                    if *lease_id >= self.next_lease_id {
+                        return Err(format!(
+                            "topic {name} group {group}: lease id {lease_id} is at or above next_lease_id {}",
+                            self.next_lease_id
+                        ));
+                    }
+                    if lease.offset >= t.next_offset {
+                        return Err(format!(
+                            "topic {name} group {group}: lease holds offset {} at or above next_offset {}",
+                            lease.offset, t.next_offset
+                        ));
+                    }
+                }
+                let by_lease: BTreeMap<Offset, u64> =
+                    g.in_flight.values().map(|l| (l.offset, l.deadline_ms)).collect();
+                if by_lease.len() != g.in_flight.len() {
+                    return Err(format!("topic {name} group {group}: two leases share one offset"));
+                }
+                if by_lease != g.leased_offsets {
+                    return Err(format!(
+                        "topic {name} group {group}: in_flight and leased_offsets disagree"
+                    ));
+                }
+                if g.acked_above.contains(&g.ack_watermark) {
+                    return Err(format!(
+                        "topic {name} group {group}: acked_above still holds the watermark {}",
+                        g.ack_watermark
+                    ));
+                }
+                if let Some(lowest) = g.acked_above.iter().next() {
+                    if *lowest < g.ack_watermark {
+                        return Err(format!(
+                            "topic {name} group {group}: acked_above holds {lowest} below watermark {}",
+                            g.ack_watermark
+                        ));
+                    }
+                }
+                if let Some(lowest) = g.leased_offsets.keys().next() {
+                    if *lowest < g.ack_watermark {
+                        return Err(format!(
+                            "topic {name} group {group}: lease at {lowest} is below watermark {}",
+                            g.ack_watermark
+                        ));
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Internal consistency check, exposed for the fuzz targets and unit tests.
+    #[doc(hidden)]
+    pub fn debug_check_invariants(&self) -> Result<(), String> {
+        self.validate()
+    }
+
+    /// Retained message count for one topic, or `None` if the topic is unknown.
+    #[doc(hidden)]
+    pub fn debug_topic_len(&self, topic: &str) -> Option<usize> {
+        self.topics.get(topic).map(|t| t.messages.len())
+    }
+
+    /// Counts that bound how much memory the replicated state holds.
+    #[doc(hidden)]
+    pub fn debug_footprint(&self) -> QueueFootprint {
+        let mut f = QueueFootprint {
+            topics: self.topics.len(),
+            ..QueueFootprint::default()
+        };
+        for (name, t) in &self.topics {
+            f.name_bytes += name.len();
+            f.messages += t.messages.len();
+            f.payload_bytes += t.messages.values().map(|m| m.payload.len()).sum::<usize>();
+            f.groups += t.groups.len();
+            f.name_bytes += t.groups.keys().map(|g| g.len()).sum::<usize>();
+            f.dedup_entries += t.dedup.len();
+            f.dedup_bytes += t.dedup.keys().map(|(p, _)| p.len()).sum::<usize>();
+            f.dedup_bytes += t.dedup_order.iter().map(|(p, _)| p.len()).sum::<usize>();
+        }
+        f
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[doc(hidden)]
+pub struct QueueFootprint {
+    pub topics: usize,
+    pub groups: usize,
+    pub messages: usize,
+    pub payload_bytes: usize,
+    pub dedup_entries: usize,
+    pub dedup_bytes: usize,
+    pub name_bytes: usize,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -338,12 +624,17 @@ fn poll(
     let Some(t) = topics.get_mut(topic) else {
         return Vec::new();
     };
+    let visibility_timeout_ms = visibility_timeout_ms.min(MAX_VISIBILITY_MS);
     if sweep_idle_groups(t, ts_ms) {
         reclaim(t);
+    }
+    if !t.groups.contains_key(group) && t.groups.len() >= MAX_GROUPS_PER_TOPIC {
+        return Vec::new();
     }
     let first = t.messages.keys().next().copied().unwrap_or(t.next_offset);
     let g = t.groups.entry(group.to_string()).or_insert_with(|| GroupState {
         ack_watermark: first,
+        last_active_ms: ts_ms,
         ..GroupState::default()
     });
     g.expire(ts_ms);
@@ -351,7 +642,7 @@ fn poll(
 
     let max = max as usize;
     let poll_count = g.poll_count;
-    g.poll_count += 1;
+    g.poll_count = g.poll_count.saturating_add(1);
 
     if max == 0 {
         return Vec::new();
@@ -401,7 +692,7 @@ fn poll(
     let mut items = Vec::new();
     for (_, offset) in chosen {
         let lease_id = *next_lease;
-        *next_lease += 1;
+        *next_lease = next_lease.saturating_add(1);
         let deadline_ms = ts_ms.saturating_add(visibility_timeout_ms);
         g.in_flight.insert(lease_id, Lease { offset, deadline_ms });
         g.leased_offsets.insert(offset, deadline_ms);
@@ -486,6 +777,25 @@ fn purge_retained(t: &mut TopicState, now_ms: u64) {
             g.advance_watermark(boundary);
         }
     }
+    prune_dedup(t, boundary);
+}
+
+/// Drop dedup keys for messages retention has already removed.
+///
+/// Without this the dedup table is the one part of a topic retention does not
+/// bound: it keeps a `(producer_id, seq)` pair per produce whether or not the
+/// message it points at still exists. `dedup_order` is in insertion order,
+/// which is offset order, so this stops at the first key still in range.
+fn prune_dedup(t: &mut TopicState, boundary: Offset) {
+    while t
+        .dedup_order
+        .front()
+        .is_some_and(|key| t.dedup.get(key).is_none_or(|offset| *offset < boundary))
+    {
+        if let Some(key) = t.dedup_order.pop_front() {
+            t.dedup.remove(&key);
+        }
+    }
 }
 
 fn reclaim_topic(topics: &mut BTreeMap<String, TopicState>, topic: &str) {
@@ -503,11 +813,22 @@ fn reclaim(t: &mut TopicState) {
     gc_idle_groups(t);
 }
 
+/// Drop consumer groups that have been idle past the expiry. Runs on poll and on
+/// commit - the two requests that create a group - so a topic reclaims whichever
+/// of them its clients use.
 fn sweep_idle_groups(t: &mut TopicState, now_ms: u64) -> bool {
+    // A group restored from a pre-0.8 snapshot, or created by a commit that
+    // carried no clock, has no activity stamp. Stamp it now rather than exempt
+    // it: an unstamped group used to be immortal, which is how a run of commits
+    // with fresh group names could grow the state and never give it back.
+    for g in t.groups.values_mut() {
+        if g.last_active_ms == 0 {
+            g.last_active_ms = now_ms;
+        }
+    }
     let before = t.groups.len();
     t.groups.retain(|_, g| {
-        g.last_active_ms == 0
-            || now_ms.saturating_sub(g.last_active_ms) <= GROUP_IDLE_EXPIRE_MS
+        now_ms.saturating_sub(g.last_active_ms) <= GROUP_IDLE_EXPIRE_MS
             || g.in_flight.values().any(|l| l.deadline_ms > now_ms)
     });
     t.groups.len() != before
@@ -526,18 +847,50 @@ fn gc_idle_groups(t: &mut TopicState) {
     });
 }
 
-fn group_entry<'a>(t: &'a mut TopicState, group: &str) -> &'a mut GroupState {
+/// The group's state, creating it if the topic has room for another one.
+///
+/// `None` means the topic is already holding [`MAX_GROUPS_PER_TOPIC`] groups
+/// and this name is not one of them.
+fn group_entry<'a>(
+    t: &'a mut TopicState,
+    group: &str,
+    now_ms: Option<u64>,
+) -> Option<&'a mut GroupState> {
+    if !t.groups.contains_key(group) && t.groups.len() >= MAX_GROUPS_PER_TOPIC {
+        return None;
+    }
     let first = t.messages.keys().next().copied().unwrap_or(t.next_offset);
-    t.groups.entry(group.to_string()).or_insert_with(|| GroupState {
+    Some(t.groups.entry(group.to_string()).or_insert_with(|| GroupState {
         ack_watermark: first,
+        last_active_ms: now_ms.unwrap_or(0),
         ..GroupState::default()
-    })
+    }))
 }
 
-fn commit(topics: &mut BTreeMap<String, TopicState>, topic: &str, group: &str, offset: Offset) {
+fn commit(
+    topics: &mut BTreeMap<String, TopicState>,
+    topic: &str,
+    group: &str,
+    offset: Offset,
+    now_ms: Option<u64>,
+) {
     if let Some(t) = topics.get_mut(topic) {
-        let g = group_entry(t, group);
+        if let Some(now_ms) = now_ms {
+            if sweep_idle_groups(t, now_ms) {
+                reclaim(t);
+            }
+        }
+        // A watermark past the end of the topic would hide every message
+        // produced afterwards from this group, and leaves the counter free to
+        // run to the top of its range.
+        let offset = offset.min(t.next_offset);
+        let Some(g) = group_entry(t, group, now_ms) else {
+            return;
+        };
         g.advance_watermark(offset);
+        if let Some(now_ms) = now_ms {
+            g.last_active_ms = g.last_active_ms.max(now_ms);
+        }
     }
 }
 
@@ -644,6 +997,171 @@ mod tests {
             AppResponse::Polled { items } => items.into_iter().map(|d| (d.lease_id, d.offset)).collect(),
             other => panic!("expected Polled, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn a_commit_past_the_end_cannot_hide_later_messages() {
+        let mut q = Queue::default();
+        produce(&mut q, "t", 0, b"a", "", 0);
+        q.apply(AppRequest::CommitOffsetAt {
+            topic: TopicId::from("t"),
+            group: GroupId::from("g"),
+            offset: u64::MAX,
+            ts_ms: 1,
+        });
+        produce(&mut q, "t", 0, b"b", "", 0);
+        let got: Vec<Offset> = poll_offsets(&mut q, "t", "g", 10, 1000, 2)
+            .into_iter()
+            .map(|(_, o)| o)
+            .collect();
+        assert_eq!(got, vec![1], "the message produced after the commit must still be served");
+        assert_eq!(q.validate(), Ok(()));
+    }
+
+    #[test]
+    fn over_long_names_are_rejected() {
+        let mut q = Queue::default();
+        let long = "x".repeat(MAX_NAME_BYTES + 1);
+        assert!(matches!(
+            q.apply(AppRequest::CreateTopic {
+                topic: TopicId(long.clone())
+            }),
+            AppResponse::Rejected { .. }
+        ));
+        assert!(matches!(
+            q.apply(AppRequest::Poll {
+                topic: TopicId::from("t"),
+                group: GroupId(long),
+                max: 1,
+                visibility_timeout_ms: 1000,
+                ts_ms: 0,
+            }),
+            AppResponse::Rejected { .. }
+        ));
+        assert_eq!(q.metrics().topics, 0);
+    }
+
+    #[test]
+    fn an_over_long_producer_id_is_rejected() {
+        let mut q = Queue::default();
+        let long = "p".repeat(MAX_PRODUCER_ID_BYTES + 1);
+        assert!(matches!(
+            q.apply(AppRequest::Produce {
+                topic: TopicId::from("t"),
+                priority: Priority(0),
+                content_type: ContentType::Raw,
+                payload: Bytes::from_static(b"x"),
+                producer_id: long,
+                seq: 0,
+                ts_ms: 0,
+            }),
+            AppResponse::Rejected { .. }
+        ));
+        assert_eq!(q.metrics().messages, 0);
+    }
+
+    #[test]
+    fn the_topic_limit_is_enforced() {
+        let mut q = Queue::default();
+        for i in 0..MAX_TOPICS {
+            produce(&mut q, &format!("t{i}"), 0, b"a", "", 0);
+        }
+        assert_eq!(q.metrics().topics as usize, MAX_TOPICS);
+        assert!(matches!(
+            q.apply(AppRequest::CreateTopic {
+                topic: TopicId::from("one-more")
+            }),
+            AppResponse::Rejected { .. }
+        ));
+        assert_eq!(q.metrics().topics as usize, MAX_TOPICS);
+    }
+
+    #[test]
+    fn the_group_limit_is_enforced() {
+        let mut q = Queue::default();
+        produce(&mut q, "t", 0, b"a", "", 0);
+        for i in 0..MAX_GROUPS_PER_TOPIC {
+            q.apply(AppRequest::CommitOffsetAt {
+                topic: TopicId::from("t"),
+                group: GroupId(format!("g{i}")),
+                offset: 0,
+                ts_ms: 1,
+            });
+        }
+        assert_eq!(q.debug_footprint().groups, MAX_GROUPS_PER_TOPIC);
+        assert!(
+            poll_offsets(&mut q, "t", "one-more", 10, 1000, 1).is_empty(),
+            "a group past the cap gets no state and no delivery"
+        );
+        assert_eq!(q.debug_footprint().groups, MAX_GROUPS_PER_TOPIC);
+    }
+
+    #[test]
+    fn a_commit_created_group_expires_when_idle() {
+        let mut q = Queue::default();
+        produce(&mut q, "t", 0, b"a", "", 0);
+        q.apply(AppRequest::CommitOffsetAt {
+            topic: TopicId::from("t"),
+            group: GroupId::from("ghost"),
+            offset: 0,
+            ts_ms: 1,
+        });
+        assert_eq!(q.debug_footprint().groups, 1);
+        q.apply(AppRequest::CommitOffsetAt {
+            topic: TopicId::from("t"),
+            group: GroupId::from("live"),
+            offset: 0,
+            ts_ms: 1 + GROUP_IDLE_EXPIRE_MS + 1,
+        });
+        assert_eq!(
+            q.debug_footprint().groups,
+            1,
+            "the idle group is swept by the later commit"
+        );
+    }
+
+    #[test]
+    fn retention_prunes_the_dedup_table() {
+        let mut q = Queue::default();
+        q.apply(AppRequest::SetRetention {
+            topic: TopicId::from("t"),
+            max_messages: 2,
+            max_age_ms: 0,
+        });
+        for seq in 0..50 {
+            produce(&mut q, "t", 0, b"a", "p", seq);
+        }
+        let f = q.debug_footprint();
+        assert_eq!(f.messages, 2);
+        assert_eq!(f.dedup_entries, 2, "dedup keys outlived the messages they point at");
+        assert_eq!(q.validate(), Ok(()));
+    }
+
+    #[test]
+    fn a_deduplicated_produce_still_enforces_retention() {
+        let mut q = Queue::default();
+        for seq in 0..3 {
+            produce(&mut q, "t", 0, b"a", "p", seq);
+        }
+        q.apply(AppRequest::SetRetention {
+            topic: TopicId::from("t"),
+            max_messages: 1,
+            max_age_ms: 0,
+        });
+        produce(&mut q, "t", 0, b"a", "p", 0);
+        assert_eq!(q.debug_topic_len("t"), Some(1));
+    }
+
+    #[test]
+    fn the_visibility_timeout_is_clamped() {
+        let mut q = Queue::default();
+        produce(&mut q, "t", 0, b"a", "", 0);
+        assert_eq!(poll_offsets(&mut q, "t", "g", 1, u64::MAX, 0).len(), 1);
+        assert_eq!(
+            poll_offsets(&mut q, "t", "g", 1, 1000, MAX_VISIBILITY_MS + 1).len(),
+            1,
+            "a lease taken with an unbounded timeout must still lapse at the cap"
+        );
     }
 
     #[test]
@@ -888,8 +1406,10 @@ mod tests {
 
     #[test]
     fn drained_topic_sheds_idle_caught_up_groups() {
-        let mut t = TopicState::default();
-        t.next_offset = 10;
+        let mut t = TopicState {
+            next_offset: 10,
+            ..TopicState::default()
+        };
         for i in 0..(GROUP_GC_THRESHOLD + 5) {
             t.groups.insert(
                 format!("g{i}"),
@@ -905,8 +1425,10 @@ mod tests {
 
     #[test]
     fn small_group_counts_are_left_alone() {
-        let mut t = TopicState::default();
-        t.next_offset = 10;
+        let mut t = TopicState {
+            next_offset: 10,
+            ..TopicState::default()
+        };
         t.groups.insert(
             "g".to_string(),
             GroupState {
@@ -920,8 +1442,10 @@ mod tests {
 
     #[test]
     fn group_holding_a_lease_or_lagging_survives_gc() {
-        let mut t = TopicState::default();
-        t.next_offset = 10;
+        let mut t = TopicState {
+            next_offset: 10,
+            ..TopicState::default()
+        };
         for i in 0..(GROUP_GC_THRESHOLD + 1) {
             t.groups.insert(
                 format!("g{i}"),
@@ -958,12 +1482,16 @@ mod tests {
 
     #[test]
     fn explicit_retention_overrides_default_cap() {
-        let mut by_count = TopicState::default();
-        by_count.retain_max_messages = 50;
+        let by_count = TopicState {
+            retain_max_messages: 50,
+            ..TopicState::default()
+        };
         assert_eq!(effective_retention(&by_count), (50, 0));
 
-        let mut by_age = TopicState::default();
-        by_age.retain_max_age_ms = 1000;
+        let by_age = TopicState {
+            retain_max_age_ms: 1000,
+            ..TopicState::default()
+        };
         assert_eq!(effective_retention(&by_age), (0, 1000));
     }
 
@@ -1142,7 +1670,19 @@ mod tests {
     fn idle_group_with_unexpired_lease_survives() {
         let mut q = Queue::default();
         produce(&mut q, "t", 0, b"a", "", 0);
-        poll_offsets(&mut q, "t", "dead", 1, GROUP_IDLE_EXPIRE_MS * 2, 1_000);
+        poll_offsets(&mut q, "t", "dead", 1, MAX_VISIBILITY_MS, 1_000);
+        // A poll can no longer set a deadline past the idle expiry, because the
+        // visibility timeout is capped well below it. Put one there by hand, the
+        // way a state restored from an older release can carry it, so the sweep
+        // still has a lease to respect.
+        let far = GROUP_IDLE_EXPIRE_MS * 3;
+        let g = q.topics.get_mut("t").unwrap().groups.get_mut("dead").unwrap();
+        for lease in g.in_flight.values_mut() {
+            lease.deadline_ms = far;
+        }
+        for deadline in g.leased_offsets.values_mut() {
+            *deadline = far;
+        }
         poll_offsets(&mut q, "t", "live", 10, 1000, GROUP_IDLE_EXPIRE_MS + 2_000);
         assert!(
             q.topics["t"].groups.contains_key("dead"),
@@ -1151,7 +1691,19 @@ mod tests {
     }
 
     #[test]
-    fn group_without_activity_timestamp_never_expires() {
+    fn a_parked_lease_cannot_outlive_the_group_expiry() {
+        let mut q = Queue::default();
+        produce(&mut q, "t", 0, b"a", "", 0);
+        poll_offsets(&mut q, "t", "parked", 1, u64::MAX, 1_000);
+        poll_offsets(&mut q, "t", "live", 10, 1000, GROUP_IDLE_EXPIRE_MS + 2_000);
+        assert!(
+            !q.topics["t"].groups.contains_key("parked"),
+            "one poll must not be able to hold a group past the idle expiry"
+        );
+    }
+
+    #[test]
+    fn a_group_without_an_activity_timestamp_is_stamped_then_expires() {
         let mut q = Queue::default();
         produce(&mut q, "t", 0, b"a", "", 0);
         q.apply(AppRequest::CommitOffset {
@@ -1159,10 +1711,16 @@ mod tests {
             group: GroupId::from("commit-only"),
             offset: 0,
         });
-        poll_offsets(&mut q, "t", "live", 10, 1000, GROUP_IDLE_EXPIRE_MS * 10);
+        let first = GROUP_IDLE_EXPIRE_MS * 10;
+        poll_offsets(&mut q, "t", "live", 10, 1000, first);
         assert!(
             q.topics["t"].groups.contains_key("commit-only"),
-            "a group with no recorded poll activity (legacy or commit-created) is immune"
+            "the first sweep stamps an unstamped group rather than dropping it"
+        );
+        poll_offsets(&mut q, "t", "live", 10, 1000, first + GROUP_IDLE_EXPIRE_MS + 1);
+        assert!(
+            !q.topics["t"].groups.contains_key("commit-only"),
+            "once stamped, it expires on the ordinary idle schedule"
         );
     }
 
@@ -1175,7 +1733,7 @@ mod tests {
             return Vec::new();
         }
         let base = max / RESERVED_DEN as usize;
-        let bonus = usize::from((poll_count + 1) % RESERVED_DEN == 0);
+        let bonus = usize::from((poll_count + 1).is_multiple_of(RESERVED_DEN));
         let reserved = (base + bonus).min(max);
         let priority_slots = max - reserved;
         let by_offset = candidates.to_vec();

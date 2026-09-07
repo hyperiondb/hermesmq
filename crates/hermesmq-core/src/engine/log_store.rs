@@ -14,12 +14,13 @@ use crate::storage::Storage;
 use crate::types::NodeId;
 use crate::RedbStore;
 
-pub(crate) const KEY_PURGED: &str = "log:purged";
+#[doc(hidden)]
+pub const KEY_PURGED: &str = "log:purged";
 const FLUSH_MAX_ENTRIES: usize = 512;
 const FLUSH_MAX_BYTES: usize = 8 * 1024 * 1024;
 
 enum FlushJob {
-    Append(Vec<(u64, Bytes)>, LogFlushed<TypeConfig>),
+    Append(Vec<(u64, Bytes)>, Option<LogFlushed<TypeConfig>>),
     Barrier(oneshot::Sender<()>),
 }
 
@@ -70,6 +71,40 @@ impl<S: Storage> LogStore<S> {
             .next_back()
             .copied()
     }
+
+    /// Append without openraft's completion callback, exposed for the fuzz targets.
+    #[doc(hidden)]
+    pub fn fuzz_append(
+        &self,
+        entries: &[Entry<TypeConfig>],
+    ) -> Result<(), StorageError<NodeId>> {
+        let mut batch = Vec::new();
+        for entry in entries {
+            batch.push((entry.log_id.index, Bytes::from(enc(entry)?)));
+        }
+        {
+            let mut pending = self.shared.pending.lock().unwrap();
+            for (index, bytes) in &batch {
+                pending.insert(*index, bytes.clone());
+            }
+        }
+        if self.jobs.send(FlushJob::Append(batch, None)).is_err() {
+            return Err(swrite("log flusher thread is gone"));
+        }
+        Ok(())
+    }
+
+    /// Wait until the flusher thread has drained everything queued so far.
+    #[doc(hidden)]
+    pub async fn fuzz_barrier(&self) {
+        self.barrier().await;
+    }
+
+    /// Indices still held in memory awaiting a flush.
+    #[doc(hidden)]
+    pub fn fuzz_pending_indices(&self) -> Vec<u64> {
+        self.shared.pending.lock().unwrap().keys().copied().collect()
+    }
 }
 
 fn run_flusher<S: Storage>(shared: Arc<Shared<S>>, mut rx: mpsc::UnboundedReceiver<FlushJob>) {
@@ -84,7 +119,7 @@ fn run_flusher<S: Storage>(shared: Arc<Shared<S>>, mut rx: mpsc::UnboundedReceiv
                 Some(FlushJob::Append(entries, callback)) => {
                     bytes += entries.iter().map(|(_, b)| b.len()).sum::<usize>();
                     batch.extend(entries);
-                    callbacks.push(callback);
+                    callbacks.extend(callback);
                 }
                 Some(FlushJob::Barrier(done)) => {
                     barriers.push(done);
@@ -297,7 +332,7 @@ impl<S: Storage> RaftLogStorage<TypeConfig> for LogStore<S> {
                 pending.insert(*index, bytes.clone());
             }
         }
-        if self.jobs.send(FlushJob::Append(batch, callback)).is_err() {
+        if self.jobs.send(FlushJob::Append(batch, Some(callback))).is_err() {
             return Err(swrite("log flusher thread is gone"));
         }
         Ok(())

@@ -9,7 +9,8 @@ const LOG: TableDefinition<u64, &[u8]> = TableDefinition::new("raft_log");
 const META: TableDefinition<&str, &[u8]> = TableDefinition::new("meta");
 
 const KEY_VOTE: &str = "sys:vote";
-pub(crate) const KEY_COMMITTED: &str = "sys:committed";
+#[doc(hidden)]
+pub const KEY_COMMITTED: &str = "sys:committed";
 
 fn st<E: std::fmt::Display>(e: E) -> Error {
     Error::Storage(e.to_string())
