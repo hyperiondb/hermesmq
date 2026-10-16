@@ -325,9 +325,9 @@ returns after its batch is durable and replicated — semantics are unchanged.
 
 ## Testing
 
-`cargo test` covers: queue semantics (unit + a `proptest` property), the real TCP/protobuf protocol,
-3-node replication, leader/follower loss, quorum-loss safety, network partition + heal, on-disk
-restart durability, slow-disk tolerance, and the HTTP endpoints.
+```bash
+cargo test
+```
 
 ### End-to-end (Docker)
 

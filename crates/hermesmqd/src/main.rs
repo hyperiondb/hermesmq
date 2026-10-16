@@ -9,6 +9,9 @@ use hermesmq_core::{
 };
 use tokio::net::TcpListener;
 
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 #[derive(Parser, Debug)]
 #[command(name = "hermesmqd", version, about = "Raft-replicated message queue")]
 struct Cli {

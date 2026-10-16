@@ -39,6 +39,13 @@ const ACK_QUEUE_DEPTH: usize = 1024;
 const ACK_BATCH_MAX: usize = 1024;
 const ACK_WRITE_PIPELINE: usize = 4;
 const ACK_GRACE_MS: u64 = 5_000;
+const SUBSCRIBE_HEARTBEAT: Duration = Duration::from_secs(10);
+const SUBSCRIBE_WRITE_TIMEOUT: Duration = Duration::from_secs(10);
+const TCP_KEEPALIVE_IDLE: Duration = Duration::from_secs(15);
+const TCP_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(5);
+const TCP_KEEPALIVE_RETRIES: u32 = 3;
+#[cfg(any(target_os = "linux", target_os = "android"))]
+const TCP_USER_TIMEOUT: Duration = Duration::from_secs(30);
 
 struct OffsetTrack {
     lease_id: LeaseId,
@@ -115,6 +122,12 @@ impl SubTracking {
             self.acked_recently.insert(offset, until);
         }
         Some(track.lease_id)
+    }
+
+    pub fn drain_leases(&mut self) -> Vec<LeaseId> {
+        self.lease_to_offset.clear();
+        self.acked_recently.clear();
+        self.by_offset.drain().map(|(_, track)| track.lease_id).collect()
     }
 
     pub fn live_count(&mut self, now_ms: u64, grace_ms: u64) -> usize {
@@ -960,7 +973,10 @@ async fn handle_subscribe(
         })
     };
 
-    loop {
+    let mut last_write = Instant::now();
+    let mut undelivered: Vec<LeaseId> = Vec::new();
+
+    'session: loop {
         if closed.load(Ordering::SeqCst) {
             break;
         }
@@ -970,6 +986,12 @@ async fn handle_subscribe(
             if m.current_leader != Some(m.id) {
                 break;
             }
+        }
+        if last_write.elapsed() >= SUBSCRIBE_HEARTBEAT {
+            if !write_subscriber(&mut write_half, &resp_polled(Vec::new())).await {
+                break;
+            }
+            last_write = Instant::now();
         }
 
         let notifier = ctx.notifier(&sub.topic);
@@ -1017,7 +1039,8 @@ async fn handle_subscribe(
                                     burst.max(1) as f64,
                                 );
                             }
-                            for d in items {
+                            let mut items = items.into_iter();
+                            while let Some(d) = items.next() {
                                 pushed_any = true;
                                 if !auto {
                                     let now = now_ms();
@@ -1042,14 +1065,13 @@ async fn handle_subscribe(
                                         Delivery::Push => {}
                                     }
                                 }
-                                let frame = resp_polled(vec![d]);
-                                if write_frame(&mut write_half, &frame.encode_to_vec())
-                                    .await
-                                    .is_err()
-                                {
-                                    reader.abort();
-                                    return Ok(());
+                                if !write_subscriber(&mut write_half, &resp_polled(vec![d])).await {
+                                    if !auto {
+                                        undelivered.extend(items.map(|rest| rest.lease_id));
+                                    }
+                                    break 'session;
                                 }
+                                last_write = Instant::now();
                             }
                         }
                     }
@@ -1069,6 +1091,43 @@ async fn handle_subscribe(
     }
 
     reader.abort();
+    if !auto {
+        undelivered.extend(crate::lock(&tracking).drain_leases());
+        for lease_id in undelivered {
+            let _ = ctx
+                .ack_tx
+                .send(AckJob {
+                    topic: topic.0.clone(),
+                    group: group.0.clone(),
+                    lease_id,
+                    nack: true,
+                    reply: None,
+                })
+                .await;
+        }
+    }
+    Ok(())
+}
+
+async fn write_subscriber(write_half: &mut OwnedWriteHalf, resp: &Response) -> bool {
+    matches!(
+        tokio::time::timeout(SUBSCRIBE_WRITE_TIMEOUT, write_frame(write_half, &resp.encode_to_vec())).await,
+        Ok(Ok(()))
+    )
+}
+
+fn set_client_socket_options(stream: &TcpStream) -> io::Result<()> {
+    let sock = socket2::SockRef::from(stream);
+    let keepalive = socket2::TcpKeepalive::new()
+        .with_time(TCP_KEEPALIVE_IDLE)
+        .with_interval(TCP_KEEPALIVE_INTERVAL);
+    #[cfg(not(windows))]
+    let keepalive = keepalive.with_retries(TCP_KEEPALIVE_RETRIES);
+    #[cfg(windows)]
+    let _ = TCP_KEEPALIVE_RETRIES;
+    sock.set_tcp_keepalive(&keepalive)?;
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    sock.set_tcp_user_timeout(Some(TCP_USER_TIMEOUT))?;
     Ok(())
 }
 
@@ -1117,6 +1176,9 @@ pub async fn serve_clients_authenticated(
                     continue;
                 };
                 let _ = stream.set_nodelay(true);
+                if let Err(e) = set_client_socket_options(&stream) {
+                    tracing::warn!("client connection from {addr}: keepalive not set: {e}");
+                }
                 let ctx = ctx.clone();
                 let token = token.clone();
                 tokio::spawn(async move {

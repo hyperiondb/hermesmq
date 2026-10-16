@@ -11,7 +11,7 @@ categories.workspace = true
 description = "Core engine for hermesmq: queue state machine and Raft application types"
 
 [dependencies]
-hermesmq-proto = { path = "../hermesmq-proto", version = "=1.0.0" }
+hermesmq-proto = { path = "../hermesmq-proto", version = "=1.0.1" }
 bytes.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -22,6 +22,7 @@ prost.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 tokio.workspace = true
+socket2 = { version = "=0.6.4", features = ["all"] }
 
 [dev-dependencies]
 tokio.workspace = true
